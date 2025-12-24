@@ -1,576 +1,744 @@
 import os
 import re
-import json
+import streamlit as st
+import pandas as pd
 import sqlite3
 from datetime import datetime, date
 
-import pandas as pd
-import streamlit as st
-
-# =========================
-# CONFIG / DB (NÃO USE /tmp)
-# =========================
-DB_PATH = os.environ.get("DB_PATH", "data/snapshots.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# =========================================================
+# CONFIG / DB
+# =========================================================
+DB_PATH = os.environ.get("DB_PATH", "/tmp/snapshots.db")
 
 COMPETITORS = ["AUMA", "BAGATELLE", "PERFUMES_BHZ"]
 
-# Mapeamento Nubmetrics -> canônico
-CANON_MAP = {
-    "título": "titulo",
-    "marca": "marca",
-    "vendas em $": "vendas_valor",
-    "vendas em unid.": "vendas_unid",
-    "preço médio": "preco_medio",
-    "tipo de publicação": "tipo_publicacao",
-    "fulfillment": "full",
-    "catálogo.": "catalogo",
-    "com frete grátis": "frete_gratis",
-    "com mercado envios": "mercado_envios",
-    "com desconto": "desconto",
-    "sku": "sku",
-    "oem": "oem",
-    "gtin": "gtin",
-    "n° peça": "n_peca",
-    "n° peça ": "n_peca",
-    "estado": "estado",
-    "mercadopago": "mercadopago",
-    "republicada": "republicada",
-    "condição": "condicao",
-    "estoque": "estoque",
-}
+# =========================================================
+# PAGE
+# =========================================================
+st.set_page_config(page_title="PureHome • Monitor Nubmetrics", layout="wide")
+st.title("PureHome • Monitor de Concorrentes (Nubmetrics)")
+st.caption("Suba 3 exports do Nubmetrics (um por concorrente) → compara com o upload anterior + BI clean + Ranking de mais vendidos.")
 
-WATCH_COLS = [
-    "preco_medio",
-    "estoque",
-    "desconto",
-    "frete_gratis",
-    "full",
-    "tipo_publicacao",
-    "vendas_unid",
-]
-
-
-# =========================
-# DB
-# =========================
+# =========================================================
+# DB HELPERS
+# =========================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                competitor TEXT NOT NULL,
-                snapshot_date TEXT NOT NULL,
-                uploaded_at TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                data_json TEXT NOT NULL
-            )
-            """
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            competitor TEXT NOT NULL,
+            snapshot_date TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            data_json TEXT NOT NULL
         )
+        """)
+init_db()
 
-
-def save_snapshot(competitor: str, snapshot_date: str, filename: str, df_key: pd.DataFrame):
-    payload = json.dumps(df_key.to_dict(orient="records"), ensure_ascii=False)
+def save_snapshot(competitor: str, snapshot_date: str, filename: str, df: pd.DataFrame):
+    payload = df.to_json(orient="records", force_ascii=False)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            """
-            INSERT INTO snapshots (competitor, snapshot_date, uploaded_at, filename, data_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (competitor, snapshot_date, datetime.now().isoformat(timespec="seconds"), filename, payload),
+            "INSERT INTO snapshots (competitor, snapshot_date, uploaded_at, filename, data_json) VALUES (?, ?, ?, ?, ?)",
+            (competitor, snapshot_date, datetime.now().isoformat(timespec="seconds"), filename, payload)
         )
 
-
-def load_latest_snapshot(competitor: str):
-    """✅ SEMPRE pega o último upload (independente de data)"""
+def load_last_snapshot_before(competitor: str, snapshot_date: str):
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             """
-            SELECT snapshot_date, uploaded_at, filename, data_json, id
+            SELECT snapshot_date, uploaded_at, filename, data_json
+            FROM snapshots
+            WHERE competitor = ? AND snapshot_date < ?
+            ORDER BY snapshot_date DESC, id DESC
+            LIMIT 1
+            """,
+            (competitor, snapshot_date)
+        ).fetchone()
+    if not row:
+        return None
+    d, uploaded_at, filename, data_json = row
+    df = pd.read_json(data_json, orient="records")
+    return {"snapshot_date": d, "uploaded_at": uploaded_at, "filename": filename, "df": df}
+
+def load_latest_snapshot(competitor: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT snapshot_date, uploaded_at, filename, data_json
             FROM snapshots
             WHERE competitor = ?
+            ORDER BY snapshot_date DESC, id DESC
+            LIMIT 1
+            """,
+            (competitor,)
+        ).fetchone()
+    if not row:
+        return None
+    d, uploaded_at, filename, data_json = row
+    df = pd.read_json(data_json, orient="records")
+    return {"snapshot_date": d, "uploaded_at": uploaded_at, "filename": filename, "df": df}
+
+def load_snapshot_exact(competitor: str, snapshot_date: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT snapshot_date, uploaded_at, filename, data_json
+            FROM snapshots
+            WHERE competitor = ? AND snapshot_date = ?
             ORDER BY id DESC
             LIMIT 1
             """,
-            (competitor,),
+            (competitor, snapshot_date)
         ).fetchone()
-
     if not row:
         return None
+    d, uploaded_at, filename, data_json = row
+    df = pd.read_json(data_json, orient="records")
+    return {"snapshot_date": d, "uploaded_at": uploaded_at, "filename": filename, "df": df}
 
-    d, uploaded_at, filename, data_json, sid = row
-    df = pd.DataFrame(json.loads(data_json))
-    return {"snapshot_date": d, "uploaded_at": uploaded_at, "filename": filename, "df": df, "id": sid}
+# =========================================================
+# PARSE DATE FROM FILENAME
+# =========================================================
+def parse_date_from_filename(name: str):
+    """
+    Tenta achar data no nome do arquivo:
+    - 2025-12-21
+    - 20251221
+    - 21-12-2025
+    - 21122025
+    """
+    s = name.strip()
 
-
-def list_snapshots(limit=300):
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT competitor, snapshot_date, uploaded_at, filename, id
-            FROM snapshots
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return pd.DataFrame(rows, columns=["Concorrente", "Data snapshot", "Upload em", "Arquivo", "id"])
-
-
-# =========================
-# UTIL
-# =========================
-def try_extract_date_from_filename(name: str):
-    if not name:
-        return None
-
-    # yyyy-mm-dd
-    m = re.search(r"(20\d{2})[-_\.](\d{2})[-_\.](\d{2})", name)
+    m = re.search(r"(20\d{2})[-_/](\d{2})[-_/](\d{2})", s)
     if m:
         y, mo, d = m.group(1), m.group(2), m.group(3)
         return f"{y}-{mo}-{d}"
 
-    # dd-mm-yyyy
-    m = re.search(r"(\d{2})[-_\.](\d{2})[-_\.](20\d{2})", name)
+    m = re.search(r"(20\d{2})(\d{2})(\d{2})", s)
+    if m:
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        return f"{y}-{mo}-{d}"
+
+    m = re.search(r"(\d{2})[-_/](\d{2})[-_/](20\d{2})", s)
+    if m:
+        d, mo, y = m.group(1), m.group(2), m.group(3)
+        return f"{y}-{mo}-{d}"
+
+    m = re.search(r"(\d{2})(\d{2})(20\d{2})", s)
     if m:
         d, mo, y = m.group(1), m.group(2), m.group(3)
         return f"{y}-{mo}-{d}"
 
     return None
 
+# =========================================================
+# NORMALIZAÇÃO (Nubmetrics → colunas padrão)
+# =========================================================
+CANON_MAP = {
+    "título": "titulo",
+    "titulo": "titulo",
+    "marca": "marca",
+    "vendas em $": "vendas_valor",
+    "vendas em unid.": "vendas_unid",
+    "vendas em unid": "vendas_unid",
+    "preço médio": "preco_medio",
+    "preco médio": "preco_medio",
+    "preco medio": "preco_medio",
+    "tipo de publicação": "tipo_publicacao",
+    "tipo de publicacao": "tipo_publicacao",
+    "fulfillment": "full",
+    "catálogo.": "catalogo",
+    "catálogo": "catalogo",
+    "com frete grátis": "frete_gratis",
+    "com frete gratis": "frete_gratis",
+    "com mercado envios": "mercado_envios",
+    "com desconto": "desconto",
+    "sku": "sku",
+    "oem": "oem",
+    "gtin": "gtin",
+    "n° peça": "n_peca",
+    "n° peca": "n_peca",
+    "nº peça": "n_peca",
+    "nº peca": "n_peca",
+    "n peça": "n_peca",
+    "estado": "estado",
+    "mercadopago": "mercadopago",
+    "republicada": "republicada",
+    "condição": "condicao",
+    "condicao": "condicao",
+    "estoque": "estoque",
+}
+
+EXPECTED = [
+    "titulo","marca","vendas_valor","vendas_unid","preco_medio","tipo_publicacao",
+    "full","catalogo","frete_gratis","mercado_envios","desconto",
+    "sku","oem","gtin","n_peca","estoque"
+]
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
     df = df.rename(columns={c: CANON_MAP.get(c, c) for c in df.columns})
 
-    needed = WATCH_COLS + ["sku", "gtin", "n_peca", "titulo", "marca"]
-    for c in needed:
+    for c in EXPECTED:
         if c not in df.columns:
             df[c] = pd.NA
 
+    # tipos numéricos
     df["estoque"] = pd.to_numeric(df["estoque"], errors="coerce")
     df["preco_medio"] = pd.to_numeric(df["preco_medio"], errors="coerce")
     df["vendas_unid"] = pd.to_numeric(df["vendas_unid"], errors="coerce")
+    df["vendas_valor"] = pd.to_numeric(df["vendas_valor"], errors="coerce")
 
-    for c in ["sku", "gtin", "n_peca"]:
-        df[c] = df[c].astype(str).replace({"nan": "", "None": ""}).str.strip()
-
-    df["titulo"] = df["titulo"].astype(str).replace({"nan": "", "None": ""}).str.strip()
-    df["marca"] = df["marca"].astype(str).replace({"nan": "", "None": ""}).str.strip()
-
+    # chave robusta (prioridade: SKU > GTIN > N_Peca > OEM > fallback titulo+marca)
     def make_key(row):
-        for k in ["sku", "gtin", "n_peca"]:
-            v = row.get(k, "")
-            if v and v.strip():
-                return v.strip()
-        if row.get("titulo", ""):
-            return "TIT_" + row["titulo"][:80]
+        for k in ["sku","gtin","n_peca","oem"]:
+            v = row.get(k)
+            if pd.notna(v) and str(v).strip() != "":
+                return str(v).strip()
+        t = str(row.get("titulo") or "").strip().lower()
+        m = str(row.get("marca") or "").strip().lower()
+        if t:
+            base = (m + " " + t).strip()
+            base = re.sub(r"\s+", " ", base)
+            return "TT_" + base[:120]
         return None
 
     df["key"] = df.apply(make_key, axis=1)
     df = df[df["key"].notna()].copy()
     df["key"] = df["key"].astype(str)
 
+    # limpeza de "Sim/Não"
+    for b in ["desconto","frete_gratis","full","mercado_envios","catalogo","mercadopago"]:
+        if b in df.columns:
+            df[b] = df[b].astype(str).str.strip()
+
     return df
 
+# =========================================================
+# AGREGAÇÃO "ANÚNCIOS IRMÃOS" (mesmo SKU/key)
+# Regra: NÃO somar estoque (mesmo estoque compartilhado).
+# - Estoque: usa MAX (seguro)
+# - Vendas: soma (queremos ranking total do SKU)
+# - Preço: usa MIN (melhor preço anunciado)
+# - Título: pega do anúncio com mais vendas
+# =========================================================
+def aggregate_siblings(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-def aggregate_per_key(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ✅ Anúncios irmãos:
-    - NÃO soma estoque (usa MAX como estoque “compartilhado”)
-    - preço usa MIN (captura anúncio mais agressivo)
-    - cria contagem anúncios irmãos
-    """
-    return df.groupby("key", as_index=False).agg(
-        titulo=("titulo", "first"),
-        marca=("marca", "first"),
-        preco_min=("preco_medio", "min"),
-        preco_max=("preco_medio", "max"),
-        preco_avg=("preco_medio", "mean"),
-        estoque_shared=("estoque", "max"),
-        anuncios_irmaos=("key", "size"),
+    # garante colunas
+    for c in ["titulo","marca","preco_medio","estoque","vendas_unid","vendas_valor"]:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    # idx do "representante" por key (mais vendido)
+    def pick_rep(group: pd.DataFrame):
+        if group["vendas_unid"].notna().any():
+            idx = group["vendas_unid"].fillna(-1).idxmax()
+        else:
+            idx = group.index[0]
+        return idx
+
+    reps = df.groupby("key").apply(pick_rep)
+    rep_rows = df.loc[reps.values, ["key","titulo","marca"]].set_index("key")
+
+    agg = df.groupby("key", as_index=False).agg(
+        preco_min=("preco_medio","min"),
+        preco_max=("preco_medio","max"),
+        estoque_atual=("estoque","max"),
+        vendas_unid=("vendas_unid","sum"),
+        vendas_valor=("vendas_valor","sum"),
+        anuncios_irmaos=("key","size"),
     )
 
+    agg = agg.set_index("key").join(rep_rows, how="left").reset_index()
+    # reordena
+    agg = agg[[
+        "key","titulo","marca",
+        "vendas_unid","vendas_valor",
+        "preco_min","preco_max",
+        "estoque_atual",
+        "anuncios_irmaos"
+    ]]
 
-def pct_drop(old, new):
-    if pd.isna(old) or old is None or old <= 0:
-        return pd.NA
-    if pd.isna(new) or new is None:
-        return pd.NA
-    return (old - new) / old * 100.0
+    return agg
 
-
-def pct_change(old, new):
-    if pd.isna(old) or old is None or old <= 0:
-        return pd.NA
-    if pd.isna(new) or new is None:
+# =========================================================
+# DIFF (produto-level)
+# =========================================================
+def safe_pct(new, old):
+    if pd.isna(new) or pd.isna(old) or old == 0:
         return pd.NA
     return (new - old) / old * 100.0
 
+def compute_product_diff(prev_prod: pd.DataFrame, curr_prod: pd.DataFrame) -> pd.DataFrame:
+    prev = prev_prod.copy()
+    curr = curr_prod.copy()
 
-def fmt_price(v):
-    if pd.isna(v):
-        return "—"
+    merged = curr.merge(prev, on="key", how="outer", suffixes=("_new","_old"), indicator=True)
+
+    # Para ranking/BI: queremos só itens que existem nos dois (pra variação)
+    both = merged[merged["_merge"] == "both"].copy()
+
+    # variação preço: comparamos preco_min
+    both["preco_old"] = both["preco_min_old"]
+    both["preco_new"] = both["preco_min_new"]
+    both["preco_pct"] = both.apply(lambda r: safe_pct(r["preco_new"], r["preco_old"]), axis=1)
+
+    # variação estoque: comparamos estoque_atual
+    both["estoque_old"] = both["estoque_atual_old"]
+    both["estoque_new"] = both["estoque_atual_new"]
+    both["estoque_pct"] = both.apply(lambda r: safe_pct(r["estoque_new"], r["estoque_old"]), axis=1)
+
+    # "queda estoque" em % (positivo significa caiu)
+    # ex: old=100 new=40 => queda=60%
+    def drop_pct(new, old):
+        if pd.isna(new) or pd.isna(old) or old == 0:
+            return pd.NA
+        return (old - new) / old * 100.0
+
+    both["queda_estoque_pct"] = both.apply(lambda r: drop_pct(r["estoque_new"], r["estoque_old"]), axis=1)
+
+    out = both[[
+        "key",
+        "titulo_new","marca_new",
+        "vendas_unid_new","vendas_valor_new",
+        "preco_old","preco_new","preco_pct",
+        "estoque_old","estoque_new","queda_estoque_pct",
+        "anuncios_irmaos_new"
+    ]].copy()
+
+    out.rename(columns={
+        "titulo_new": "produto",
+        "marca_new": "marca",
+        "vendas_unid_new": "vendas_unid",
+        "vendas_valor_new": "vendas_valor",
+        "anuncios_irmaos_new": "anuncios_irmaos"
+    }, inplace=True)
+
+    return out
+
+# =========================================================
+# FORMATAÇÃO (tabelas clean)
+# =========================================================
+def fmt_currency(x):
+    if pd.isna(x):
+        return ""
     try:
-        s = f"{float(v):.2f}".rstrip("0").rstrip(".")
-        s = s.replace(".", ",")
-        return f"R$ {s}"
-    except Exception:
-        return "—"
+        return f"R$ {float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except:
+        return str(x)
 
-
-def fmt_pct(v):
-    if pd.isna(v):
-        return "—"
+def fmt_pct(x):
+    if pd.isna(x):
+        return ""
     try:
-        x = float(v)
-        sign = "+" if x > 0 else ""
-        return f"{sign}{x:.2f}%".replace(".", ",")
-    except Exception:
-        return "—"
+        v = float(x)
+        sign = "+" if v > 0 else ""
+        return f"{sign}{v:.2f}%".replace(".", ",")
+    except:
+        return str(x)
 
+def style_pct_series(s: pd.Series):
+    # negativos em vermelho negrito, positivos em verde negrito
+    styles = []
+    for v in s:
+        if v == "" or pd.isna(v):
+            styles.append("")
+            continue
+        # v já pode estar numérico ou string
+        try:
+            num = float(v)
+        except:
+            # tenta extrair
+            try:
+                num = float(str(v).replace("%","").replace(".","").replace(",",".").replace("+",""))
+            except:
+                styles.append("")
+                continue
+        if num < 0:
+            styles.append("color:#b00020; font-weight:700;")
+        elif num > 0:
+            styles.append("color:#0b6b0b; font-weight:700;")
+        else:
+            styles.append("")
+    return styles
 
-def compute_prev_curr(prev_key: pd.DataFrame, curr_key: pd.DataFrame) -> pd.DataFrame:
-    m = curr_key.merge(prev_key, on="key", how="inner", suffixes=("_new", "_old"))
+def style_drop_series(s: pd.Series):
+    # Queda estoque (positivo = caiu) -> vermelho negrito quando alto
+    styles = []
+    for v in s:
+        if v == "" or pd.isna(v):
+            styles.append("")
+            continue
+        try:
+            num = float(v)
+        except:
+            try:
+                num = float(str(v).replace("%","").replace(".","").replace(",",".").replace("+",""))
+            except:
+                styles.append("")
+                continue
+        if num > 0:
+            styles.append("color:#b00020; font-weight:700;")
+        else:
+            styles.append("")
+    return styles
 
-    m["drop_estoque_pct"] = m.apply(
-        lambda r: pct_drop(r.get("estoque_shared_old"), r.get("estoque_shared_new")), axis=1
-    )
-    m["preco_change_pct"] = m.apply(
-        lambda r: pct_change(r.get("preco_min_old"), r.get("preco_min_new")), axis=1
-    )
-    return m
+# =========================================================
+# UI: TABS
+# =========================================================
+tab_bi, tab_ranking, tab_controle = st.tabs(["🎯 BI (Clean)", "🏆 Ranking Mais Vendidos", "🗂️ Controle (histórico)"])
 
-
-# =========================
-# APP
-# =========================
-init_db()
-
-st.set_page_config(page_title="PureHome • Monitor Nubmetrics", layout="wide")
-st.title("PureHome • Monitor de Concorrentes (Nubmetrics)")
-st.caption("Suba 3 exports do Nubmetrics → compara SEMPRE com o último upload do mesmo concorrente + BI clean.")
-
-tab_bi, tab_precos, tab_ctrl = st.tabs(["📌 BI (Clean)", "💸 Alterações de Preço (Clean)", "🧾 Controle (histórico)"])
-
-# -------------------------
-# BI
-# -------------------------
+# =========================================================
+# TAB BI (CLEAN)
+# =========================================================
 with tab_bi:
-    st.markdown("### Regras (você controla aqui)")
+    st.subheader("Regras (você controla aqui)")
 
-    c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2, 1.2])
-
+    c1, c2, c3, c4, c5, c6 = st.columns([1.1,1.2,1.2,1.2,1.2,1.0])
     with c1:
-        stock_crit = st.number_input("Estoque crítico (≤)", min_value=0, max_value=99999, value=30, step=1)
+        estoque_critico = st.number_input("Estoque crítico (≤)", min_value=0, value=30, step=1)
     with c2:
-        require_stock_crit = st.checkbox("Exigir estoque crítico no ATAQUE", value=False)
+        exigir_estoque_critico = st.checkbox("Exigir estoque crítico no ATAQUE", value=False)
     with c3:
-        min_drop_pct = st.number_input("Queda mínima de estoque (%)", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
+        queda_min_estoque_pct = st.number_input("Queda mínima estoque (%)", min_value=0.0, value=10.0, step=1.0)
     with c4:
-        min_price_up_pct = st.number_input("Alta mínima de preço (%)", min_value=0.0, max_value=999.0, value=5.0, step=1.0)
+        alta_min_preco_pct = st.number_input("Alta mínima preço (%)", min_value=0.0, value=5.0, step=1.0)
     with c5:
-        need_comp = st.number_input("Sinal em quantos concorrentes?", min_value=1, max_value=3, value=1, step=1)
+        sinal_min_concorrentes = st.number_input("Sinal em quantos concorrentes?", min_value=1, max_value=3, value=1, step=1)
     with c6:
-        top_n = st.number_input("Mostrar TOP N", min_value=5, max_value=500, value=40, step=5)
+        top_n = st.number_input("Mostrar TOP N", min_value=5, max_value=200, value=40, step=5)
 
-    st.divider()
-    st.markdown("### Upload (3 arquivos do Nubmetrics)")
+    st.caption("ATAQUE = estoque caiu (forte) + preço subiu (forte), sempre comparando com o upload anterior do MESMO concorrente. Depois junta sinais entre concorrentes.")
 
-    auto_date_from_name = st.checkbox("Tentar pegar data automaticamente do nome do arquivo", value=True)
+    st.subheader("Upload (3 arquivos do Nubmetrics)")
+
+    pick_date_from_name = st.checkbox("Tentar pegar data automaticamente do nome do arquivo", value=True)
 
     snap_date = st.date_input("Se não achar no nome, usa esta data do snapshot", value=date.today())
     snap_date_str = snap_date.isoformat()
 
-    u1, u2, u3 = st.columns(3)
-    uploaded_files = {}
-
-    with u1:
-        uploaded_files["AUMA"] = st.file_uploader("AUMA (Export Nubmetrics)", type=["xlsx", "xls"], key="up_AUMA")
-    with u2:
-        uploaded_files["BAGATELLE"] = st.file_uploader("BAGATELLE (Export Nubmetrics)", type=["xlsx", "xls"], key="up_BAGATELLE")
-    with u3:
-        uploaded_files["PERFUMES_BHZ"] = st.file_uploader("PERFUMES_BHZ (Export Nubmetrics)", type=["xlsx", "xls"], key="up_PERFUMES_BHZ")
+    ucols = st.columns(3)
+    uploaded = {}
+    for i, comp in enumerate(COMPETITORS):
+        with ucols[i]:
+            uploaded[comp] = st.file_uploader(f"{comp} (Export Nubmetrics)", type=["xlsx","xls"], key=f"up_{comp}")
 
     process = st.button("Processar e gerar BI", type="primary")
 
-    st.divider()
-
+    # =========================================================
+    # PROCESS
+    # =========================================================
     if process:
-        missing = [c for c, f in uploaded_files.items() if f is None]
+        missing = [c for c, f in uploaded.items() if f is None]
         if missing:
             st.error(f"Faltou upload: {', '.join(missing)}")
             st.stop()
 
         per_comp = {}
         debug_rows = []
-        stock_map_all = []
 
-        # ✅ pega PREV = último upload, e só depois salva o atual
-        for comp, f in uploaded_files.items():
-            df_raw = pd.read_excel(f)
-            df_norm = normalize_df(df_raw)
-            curr_key = aggregate_per_key(df_norm)
+        # decide snapshot_date: se pegar do nome, usa do primeiro arquivo que tiver data
+        effective_date = snap_date_str
+        if pick_date_from_name:
+            for comp, f in uploaded.items():
+                d = parse_date_from_filename(f.name)
+                if d:
+                    effective_date = d
+                    break
 
-            effective_date = snap_date_str
-            if auto_date_from_name:
-                dname = try_extract_date_from_filename(f.name)
-                if dname:
-                    effective_date = dname
+        for comp, f in uploaded.items():
+            raw = pd.read_excel(f)
+            norm = normalize_df(raw)
+            prod = aggregate_siblings(norm)
 
-            prev = load_latest_snapshot(comp)  # ✅ sempre o último
+            prev = load_last_snapshot_before(comp, effective_date)
 
-            # salva snapshot atual
-            save_snapshot(comp, effective_date, f.name, curr_key)
-
-            # estoque atual por concorrente
-            stock_tmp = curr_key[["key", "estoque_shared", "anuncios_irmaos"]].copy()
-            stock_tmp["concorrente"] = comp
-            stock_map_all.append(stock_tmp)
+            # salva o snapshot produto-level
+            save_snapshot(comp, effective_date, f.name, prod)
 
             if prev is None:
-                per_comp[comp] = {"has_prev": False, "prev": None, "curr_key": curr_key, "comp_df": pd.DataFrame()}
-                debug_rows.append([comp, "— (primeiro upload)", 0, len(curr_key)])
-            else:
-                prev_key = prev["df"]
-                comp_df = compute_prev_curr(prev_key, curr_key)
-                per_comp[comp] = {"has_prev": True, "prev": prev, "curr_key": curr_key, "comp_df": comp_df}
-                debug_rows.append([comp, f'{prev["snapshot_date"]} ({prev["filename"]})', int(len(comp_df)), len(curr_key)])
+                per_comp[comp] = {"prev": None, "curr": prod, "diff": None}
+                debug_rows.append({
+                    "concorrente": comp,
+                    "comparou_com": "(primeiro snapshot)",
+                    "itens_em_comum": 0,
+                    "itens_no_upload": len(prod)
+                })
+                continue
 
-        st.session_state["per_comp"] = per_comp
+            prev_df = prev["df"].copy()
+            # garante colunas (caso mudou estrutura no passado)
+            for c in prod.columns:
+                if c not in prev_df.columns:
+                    prev_df[c] = pd.NA
 
-        st.markdown("### 🔍 Debug rápido (pra ter certeza que comparou)")
-        dbg = pd.DataFrame(debug_rows, columns=["concorrente", "comparou_com", "itens_em_comum", "itens_no_upload"])
-        st.dataframe(dbg, use_container_width=True, height=160)
+            # diff produto-level
+            diff = compute_product_diff(prev_df, prod)
+
+            # debug: itens em comum
+            common = set(prev_df["key"].astype(str)).intersection(set(prod["key"].astype(str)))
+            debug_rows.append({
+                "concorrente": comp,
+                "comparou_com": f'{prev["snapshot_date"]} ({prev["filename"]})',
+                "itens_em_comum": len(common),
+                "itens_no_upload": len(prod)
+            })
+
+            per_comp[comp] = {"prev": prev, "curr": prod, "diff": diff}
+
+        st.divider()
+        st.markdown("### 🔎 Debug rápido (pra você ter certeza que comparou)")
+        debug_df = pd.DataFrame(debug_rows)
+        st.dataframe(debug_df, use_container_width=True, height=180)
+
+        # =========================================================
+        # BI CLEAN: "ATAQUE" (queda estoque + alta preço)
+        # =========================================================
+        st.divider()
+        st.markdown("## 🎯 Produtos para ATACAR (BI CLEAN)")
 
         signals = []
-        stock_map_all = pd.concat(stock_map_all, ignore_index=True) if stock_map_all else pd.DataFrame()
-
-        # sinais por concorrente
-        for comp, pack in per_comp.items():
-            if not pack["has_prev"]:
+        for comp, d in per_comp.items():
+            if d["diff"] is None:
                 continue
 
-            d = pack["comp_df"].copy()
+            df = d["diff"].copy()
+            df["concorrente"] = comp
 
-            d["flag_drop"] = d["drop_estoque_pct"].apply(lambda x: (not pd.isna(x)) and (float(x) >= float(min_drop_pct)))
-            d["flag_price_up"] = d["preco_change_pct"].apply(lambda x: (not pd.isna(x)) and (float(x) >= float(min_price_up_pct)))
-            d["flag_stock_crit"] = d["estoque_shared_new"].fillna(10**9) <= float(stock_crit)
+            # critérios base
+            df["sinal_preco"] = df["preco_pct"].fillna(-9999) >= float(alta_min_preco_pct)
+            df["sinal_estoque"] = df["queda_estoque_pct"].fillna(-9999) >= float(queda_min_estoque_pct)
 
-            if require_stock_crit:
-                d["flag_attack"] = d["flag_drop"] & d["flag_price_up"] & d["flag_stock_crit"]
+            if exigir_estoque_critico:
+                df["sinal_critico"] = df["estoque_new"].fillna(10**9) <= float(estoque_critico)
             else:
-                d["flag_attack"] = d["flag_drop"] & d["flag_price_up"]
+                df["sinal_critico"] = True
 
-            d_attack = d[d["flag_attack"]].copy()
-            if not d_attack.empty:
-                d_attack["concorrente"] = comp
-                signals.append(
-                    d_attack[
-                        [
-                            "key",
-                            "titulo_new",
-                            "marca_new",
-                            "drop_estoque_pct",
-                            "preco_min_old",
-                            "preco_min_new",
-                            "preco_change_pct",
-                            "anuncios_irmaos_new",
-                            "concorrente",
-                        ]
-                    ]
-                )
+            df["sinal"] = df["sinal_preco"] & df["sinal_estoque"] & df["sinal_critico"]
 
-        st.markdown("### 🎯 Produtos para ATACAR (BI CLEAN)")
+            df_sig = df[df["sinal"]].copy()
+            if len(df_sig):
+                signals.append(df_sig)
 
         if not signals:
-            st.info("Não apareceu ATAQUE com as regras atuais. Baixa as % ou exige sinal em menos concorrentes.")
+            st.info("Ainda não apareceu nada forte com essas regras (ou é o primeiro upload de algum concorrente). Ajuste os %/regras e rode de novo.")
         else:
-            signals = pd.concat(signals, ignore_index=True)
+            sig_all = pd.concat(signals, ignore_index=True)
 
-            agg = signals.groupby("key", as_index=False).agg(
-                produto=("titulo_new", "first"),
-                marca=("marca_new", "first"),
-                concorrentes_com_sinal=("concorrente", "nunique"),
-                queda_estoque_pct_max=("drop_estoque_pct", "max"),
-                preco_old_min=("preco_min_old", "min"),
-                preco_new_min=("preco_min_new", "min"),
-                preco_pct_max=("preco_change_pct", "max"),
-                anuncios_irmaos_max=("anuncios_irmaos_new", "max"),
+            # agrega por produto (key) juntando concorrentes com sinal
+            def mk_estoques_por_conc(g):
+                parts = []
+                for _, r in g.iterrows():
+                    e = "" if pd.isna(r["estoque_new"]) else int(r["estoque_new"])
+                    parts.append(f'{r["concorrente"]}:{e}')
+                return " | ".join(parts)
+
+            out = sig_all.groupby("key", as_index=False).agg(
+                produto=("produto","first"),
+                marca=("marca","first"),
+                concorrentes_com_sinal=("concorrente","nunique"),
+                estoque_atual_min=("estoque_new","min"),
+                estoques_por_concorrente=("estoque_new", lambda s: ""),  # placeholder
+                queda_estoque_pct_max=("queda_estoque_pct","max"),
+                preco_anterior=("preco_old","min"),
+                preco_atual=("preco_new","min"),
+                variacao_preco_pct_max=("preco_pct","max"),
+                anuncios_irmaos=("anuncios_irmaos","max"),
             )
 
-            agg = agg[agg["concorrentes_com_sinal"] >= int(need_comp)].copy()
+            # preencher estoques_por_concorrente via apply (mais controlável)
+            sto_map = sig_all.groupby("key", as_index=False).apply(mk_estoques_por_conc).reset_index(drop=True)
+            out["estoques_por_concorrente"] = sto_map
 
-            if agg.empty:
-                st.warning("Teve sinal, mas não bateu o mínimo de concorrentes. Abaixa 'Sinal em quantos concorrentes?'.")
-            else:
-                pivot_stock = stock_map_all.pivot_table(index="key", columns="concorrente", values="estoque_shared", aggfunc="max").reset_index()
-                for c in COMPETITORS:
-                    if c not in pivot_stock.columns:
-                        pivot_stock[c] = pd.NA
+            # filtra por qtd concorrentes
+            out = out[out["concorrentes_com_sinal"] >= int(sinal_min_concorrentes)].copy()
 
-                pivot_stock["estoque_atual_min"] = pivot_stock[COMPETITORS].min(axis=1, skipna=True)
+            # ordena (mais concorrentes + maior queda + maior alta)
+            out["_ord"] = out["concorrentes_com_sinal"]*1000 + out["queda_estoque_pct_max"].fillna(0)*10 + out["variacao_preco_pct_max"].fillna(0)
+            out = out.sort_values("_ord", ascending=False).drop(columns=["_ord"]).head(int(top_n))
 
-                def stock_str(row):
-                    parts = []
-                    for c in COMPETITORS:
-                        v = row.get(c)
-                        parts.append(f"{c}:{'—' if pd.isna(v) else int(v)}")
-                    return " | ".join(parts)
+            # formatação
+            out_show = out.rename(columns={
+                "key":"SKU / ID",
+                "produto":"Produto",
+                "marca":"Marca",
+                "concorrentes_com_sinal":"Concorrentes c/ sinal",
+                "estoque_atual_min":"Estoque atual (mín)",
+                "estoques_por_concorrente":"Estoques por concorrente",
+                "queda_estoque_pct_max":"Queda estoque",
+                "preco_anterior":"Preço anterior",
+                "preco_atual":"Preço atual",
+                "variacao_preco_pct_max":"Variação preço",
+                "anuncios_irmaos":"Anúncios irmãos",
+            }).copy()
 
-                pivot_stock["estoques_por_concorrente"] = pivot_stock.apply(stock_str, axis=1)
+            # aplica formatos
+            out_show["Queda estoque"] = out_show["Queda estoque"].apply(fmt_pct)
+            out_show["Variação preço"] = out_show["Variação preço"].apply(fmt_pct)
+            out_show["Preço anterior"] = out_show["Preço anterior"].apply(fmt_currency)
+            out_show["Preço atual"] = out_show["Preço atual"].apply(fmt_currency)
+            out_show["Estoque atual (mín)"] = out_show["Estoque atual (mín)"].fillna("").apply(lambda x: "" if x=="" else int(x))
 
-                agg = agg.merge(pivot_stock[["key", "estoque_atual_min", "estoques_por_concorrente"]], on="key", how="left")
+            sty = out_show.style
+            if "Queda estoque" in out_show.columns:
+                # vermelho negrito quando caiu
+                sty = sty.apply(style_drop_series, subset=["Queda estoque"])
+            if "Variação preço" in out_show.columns:
+                sty = sty.apply(style_pct_series, subset=["Variação preço"])
 
-                show = pd.DataFrame(
-                    {
-                        "SKU / ID": agg["key"],
-                        "Produto": agg["produto"],
-                        "Marca": agg["marca"],
-                        "Concorrentes c/ sinal": agg["concorrentes_com_sinal"],
-                        "Estoque atual (mín)": agg["estoque_atual_min"],
-                        "Estoques por concorrente": agg["estoques_por_concorrente"],
-                        "Queda estoque": agg["queda_estoque_pct_max"].apply(lambda x: -abs(x) if not pd.isna(x) else pd.NA),
-                        "Preço anterior": agg["preco_old_min"],
-                        "Preço atual": agg["preco_new_min"],
-                        "Variação preço": agg["preco_pct_max"],
-                        "Anúncios irmãos": agg["anuncios_irmaos_max"],
-                    }
-                )
+            st.dataframe(sty, use_container_width=True, height=420)
 
-                show["_drop_num"] = agg["queda_estoque_pct_max"].fillna(0.0).astype(float)
-                show["_price_num"] = agg["preco_pct_max"].fillna(0.0).astype(float)
+            st.download_button(
+                "Baixar BI (CSV)",
+                out.to_csv(index=False).encode("utf-8"),
+                file_name=f"bi_clean_{effective_date}.csv",
+                mime="text/csv"
+            )
 
-                show = show.sort_values(["_drop_num", "_price_num"], ascending=[False, False]).head(int(top_n)).copy()
+        st.success("Pronto. Pode subir amanhã de novo — ele compara sempre com o último upload de cada concorrente.")
 
-                show["Queda estoque"] = show["Queda estoque"].apply(fmt_pct)
-                show["Variação preço"] = show["Variação preço"].apply(fmt_pct)
-                show["Preço anterior"] = show["Preço anterior"].apply(fmt_price)
-                show["Preço atual"] = show["Preço atual"].apply(fmt_price)
+# =========================================================
+# TAB RANKING MAIS VENDIDOS
+# =========================================================
+with tab_ranking:
+    st.subheader("🏆 Ranking Mais Vendidos (último upload de cada concorrente)")
 
-                def style_row(row):
-                    cols = list(row.index)
-                    styles = [""] * len(cols)
+    # controles
+    r1, r2, r3 = st.columns([1.2, 1.2, 2.0])
+    with r1:
+        metric = st.radio("Ordenar por", ["Vendas (unid)", "Vendas (R$)"], horizontal=True)
+    with r2:
+        top_rank = st.number_input("TOP N", min_value=10, max_value=1000, value=200, step=10)
+    with r3:
+        q = st.text_input("Buscar (produto / marca / SKU)", value="")
 
-                    def idx(c): return cols.index(c)
+    rows = []
+    for comp in COMPETITORS:
+        latest = load_latest_snapshot(comp)
+        if latest is None:
+            continue
 
-                    q = row.get("Queda estoque", "—")
-                    if isinstance(q, str) and q != "—":
-                        if q.strip().startswith("-"):
-                            styles[idx("Queda estoque")] = "color:#b91c1c;font-weight:700;"
+        curr = latest["df"].copy()
+        curr["concorrente"] = comp
+        curr["snapshot_date"] = latest["snapshot_date"]
 
-                    p = row.get("Variação preço", "—")
-                    if isinstance(p, str) and p != "—":
-                        if p.strip().startswith("-"):
-                            styles[idx("Variação preço")] = "color:#b91c1c;font-weight:700;"
-                        elif p.strip().startswith("+"):
-                            styles[idx("Variação preço")] = "color:#15803d;font-weight:700;"
+        prev = load_last_snapshot_before(comp, latest["snapshot_date"])
+        if prev is not None:
+            diff = compute_product_diff(prev["df"], curr)
+            diff["concorrente"] = comp
+            diff["snapshot_date"] = latest["snapshot_date"]
+            rows.append(diff)
+        else:
+            # sem comparação, ainda assim mostra estoque/preço atual (variações em branco)
+            base = curr.copy()
+            base = base.rename(columns={
+                "key":"key",
+                "titulo":"produto",
+                "marca":"marca",
+                "vendas_unid":"vendas_unid",
+                "vendas_valor":"vendas_valor",
+                "preco_min":"preco_new",
+                "estoque_atual":"estoque_new",
+                "anuncios_irmaos":"anuncios_irmaos"
+            })
+            base["preco_old"] = pd.NA
+            base["preco_pct"] = pd.NA
+            base["estoque_old"] = pd.NA
+            base["queda_estoque_pct"] = pd.NA
+            base = base[[
+                "key","produto","marca","vendas_unid","vendas_valor",
+                "preco_old","preco_new","preco_pct",
+                "estoque_old","estoque_new","queda_estoque_pct",
+                "anuncios_irmaos"
+            ]].copy()
+            base["concorrente"] = comp
+            base["snapshot_date"] = latest["snapshot_date"]
+            rows.append(base)
 
-                    return styles
-
-                show_display = show.drop(columns=["_drop_num", "_price_num"], errors="ignore")
-
-                st.dataframe(show_display.style.apply(style_row, axis=1), use_container_width=True, height=420)
-
-                st.download_button(
-                    "Baixar BI (CSV)",
-                    show_display.to_csv(index=False).encode("utf-8"),
-                    file_name=f"bi_clean_{date.today().isoformat()}.csv",
-                    mime="text/csv",
-                )
-
-# -------------------------
-# ALTERAÇÕES DE PREÇO (CLEAN)
-# -------------------------
-with tab_precos:
-    st.markdown("## 💸 Alterações de Preço (Clean)")
-    st.caption("Tudo que mudou de preço (subiu/baixou) comparando com o último upload do mesmo concorrente.")
-
-    per_comp = st.session_state.get("per_comp")
-
-    if not per_comp:
-        st.info("Primeiro rode o **Processar e gerar BI** na aba BI (Clean). Depois volte aqui.")
+    if not rows:
+        st.info("Ainda não tem dados salvos. Primeiro rode pelo menos 1 upload na aba BI (Clean).")
     else:
-        price_rows = []
-        for comp, pack in per_comp.items():
-            if not pack.get("has_prev"):
-                continue
+        df_rank = pd.concat(rows, ignore_index=True)
 
-            d = pack["comp_df"].copy()
-            d = d[(d["preco_min_old"].fillna(-1) != d["preco_min_new"].fillna(-1))].copy()
-            if d.empty:
-                continue
+        # filtro busca
+        if q.strip():
+            qq = q.strip().lower()
+            df_rank = df_rank[
+                df_rank["produto"].astype(str).str.lower().str.contains(qq, na=False) |
+                df_rank["marca"].astype(str).str.lower().str.contains(qq, na=False) |
+                df_rank["key"].astype(str).str.lower().str.contains(qq, na=False)
+            ].copy()
 
-            d["concorrente"] = comp
-            price_rows.append(
-                d[
-                    [
-                        "key",
-                        "titulo_new",
-                        "marca_new",
-                        "concorrente",
-                        "preco_min_old",
-                        "preco_min_new",
-                        "preco_change_pct",
-                        "estoque_shared_new",
-                        "anuncios_irmaos_new",
-                    ]
-                ]
-            )
+        # ordenar
+        sort_col = "vendas_unid" if metric == "Vendas (unid)" else "vendas_valor"
+        df_rank[sort_col] = pd.to_numeric(df_rank[sort_col], errors="coerce").fillna(0)
 
-        if not price_rows:
-            st.info("Não achei mudanças de preço entre o upload atual e o anterior.")
-        else:
-            price_all = pd.concat(price_rows, ignore_index=True)
+        df_rank = df_rank.sort_values(sort_col, ascending=False).head(int(top_rank))
 
-            price_all = price_all.rename(
-                columns={
-                    "key": "SKU / ID",
-                    "titulo_new": "Produto",
-                    "marca_new": "Marca",
-                    "concorrente": "Concorrente",
-                    "preco_min_old": "Preço anterior",
-                    "preco_min_new": "Preço atual",
-                    "preco_change_pct": "Variação preço",
-                    "estoque_shared_new": "Estoque atual",
-                    "anuncios_irmaos_new": "Anúncios irmãos",
-                }
-            )
+        # montar tabela final
+        out = df_rank.rename(columns={
+            "key":"SKU / ID",
+            "produto":"Produto",
+            "marca":"Marca",
+            "concorrente":"Concorrente",
+            "snapshot_date":"Data (último upload)",
+            "vendas_unid":"Vendas (unid)",
+            "vendas_valor":"Vendas (R$)",
+            "preco_old":"Preço anterior",
+            "preco_new":"Preço atual",
+            "preco_pct":"Variação preço",
+            "estoque_old":"Estoque anterior",
+            "estoque_new":"Estoque atual",
+            "queda_estoque_pct":"Queda estoque",
+            "anuncios_irmaos":"Anúncios irmãos",
+        }).copy()
 
-            price_all["_pct_num"] = pd.to_numeric(price_all["Variação preço"], errors="coerce")
-            price_all["Variação preço"] = price_all["Variação preço"].apply(fmt_pct)
-            price_all["Preço anterior"] = price_all["Preço anterior"].apply(fmt_price)
-            price_all["Preço atual"] = price_all["Preço atual"].apply(fmt_price)
+        # formatos
+        out["Vendas (unid)"] = out["Vendas (unid)"].fillna(0).astype(int)
+        out["Vendas (R$)"] = out["Vendas (R$)"].apply(fmt_currency)
+        out["Preço anterior"] = out["Preço anterior"].apply(fmt_currency)
+        out["Preço atual"] = out["Preço atual"].apply(fmt_currency)
+        out["Variação preço"] = out["Variação preço"].apply(fmt_pct)
+        out["Queda estoque"] = out["Queda estoque"].apply(fmt_pct)
 
-            up = price_all[price_all["_pct_num"].fillna(0) > 0].copy().sort_values("_pct_num", ascending=False).drop(columns=["_pct_num"])
-            down = price_all[price_all["_pct_num"].fillna(0) < 0].copy().sort_values("_pct_num", ascending=True).drop(columns=["_pct_num"])
+        out["Estoque atual"] = out["Estoque atual"].fillna("").apply(lambda x: "" if x=="" else int(x) if pd.notna(x) else "")
+        out["Estoque anterior"] = out["Estoque anterior"].fillna("").apply(lambda x: "" if x=="" else int(x) if pd.notna(x) else "")
 
-            def style_price_row(row):
-                cols = list(row.index)
-                styles = [""] * len(cols)
-                if "Variação preço" in cols:
-                    v = row["Variação preço"]
-                    if isinstance(v, str) and v != "—":
-                        if v.strip().startswith("-"):
-                            styles[cols.index("Variação preço")] = "color:#b91c1c;font-weight:700;"
-                        elif v.strip().startswith("+"):
-                            styles[cols.index("Variação preço")] = "color:#15803d;font-weight:700;"
-                return styles
+        sty = out.style
+        sty = sty.apply(style_pct_series, subset=["Variação preço"])
+        sty = sty.apply(style_drop_series, subset=["Queda estoque"])
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("### ✅ Preços que subiram")
-                st.dataframe(up.style.apply(style_price_row, axis=1), use_container_width=True, height=520)
-            with c2:
-                st.markdown("### 🔻 Preços que caíram")
-                st.dataframe(down.style.apply(style_price_row, axis=1), use_container_width=True, height=520)
+        st.dataframe(sty, use_container_width=True, height=560)
 
-# -------------------------
-# CONTROLE / HISTÓRICO
-# -------------------------
-with tab_ctrl:
-    st.markdown("## 🧾 Controle (histórico)")
-    hist = list_snapshots(limit=300)
-    st.dataframe(hist.drop(columns=["id"], errors="ignore"), use_container_width=True, height=520)
+        st.download_button(
+            "Baixar Ranking (CSV)",
+            df_rank.to_csv(index=False).encode("utf-8"),
+            file_name=f"ranking_mais_vendidos.csv",
+            mime="text/csv"
+        )
+
+# =========================================================
+# TAB CONTROLE (HISTÓRICO)
+# =========================================================
+with tab_controle:
+    st.subheader("🗂️ Controle (histórico de uploads)")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        hist = conn.execute("""
+            SELECT competitor as concorrente, snapshot_date as data, uploaded_at as enviado_em, filename as arquivo
+            FROM snapshots
+            ORDER BY snapshot_date DESC, id DESC
+            LIMIT 300
+        """).fetchall()
+
+    if not hist:
+        st.info("Sem histórico ainda. Faça um upload na aba BI (Clean).")
+    else:
+        hist_df = pd.DataFrame(hist, columns=["concorrente","data","enviado_em","arquivo"])
+        st.dataframe(hist_df, use_container_width=True, height=420)
+
+        st.caption("Dica: se um dia não comparar, normalmente é porque o export veio com chave diferente (SKU/GTIN/N° peça).")
