@@ -3,6 +3,7 @@ import re
 import sqlite3
 from datetime import datetime, date
 from typing import Optional
+from io import StringIO
 
 import pandas as pd
 import streamlit as st
@@ -10,12 +11,11 @@ import streamlit as st
 # =========================
 # CONFIG / DB
 # =========================
-# ✅ NÃO usa /tmp (no Streamlit Cloud pode sumir). Usa arquivo local.
 DB_PATH = os.environ.get("DB_PATH", "snapshots.db")
 
 st.set_page_config(page_title="PureHome • Monitor Nubmetrics", layout="wide")
 st.title("PureHome • Monitor de Concorrentes (Nubmetrics)")
-st.caption("Suba 3 exports do Nubmetrics (um por concorrente) → compara com o último upload anterior + BI clean de ATAQUE.")
+st.caption("Suba 3 exports do Nubmetrics (um por concorrente) → compara com o último upload anterior + BI clean e sempre mostra candidatos.")
 
 COMPETITORS = ["AUMA", "BAGATELLE", "PERFUMES_BHZ"]
 
@@ -49,7 +49,7 @@ def save_snapshot(competitor: str, snapshot_date: str, filename: str, df: pd.Dat
 
 
 def load_last_snapshot(competitor: str):
-    """Pega o ÚLTIMO snapshot salvo desse concorrente (por id desc)."""
+    """Último snapshot salvo desse concorrente."""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             """
@@ -64,7 +64,8 @@ def load_last_snapshot(competitor: str):
     if not row:
         return None
     sid, d, uploaded_at, filename, data_json = row
-    df = pd.read_json(data_json, orient="records")
+    # evita warning do pandas
+    df = pd.read_json(StringIO(data_json), orient="records")
     return {"id": sid, "snapshot_date": d, "uploaded_at": uploaded_at, "filename": filename, "df": df}
 
 
@@ -106,15 +107,12 @@ CANON_MAP = {
 
 
 def detect_snapshot_date_from_filename(filename: str) -> Optional[str]:
-    """Tenta extrair uma data do nome do arquivo."""
     name = str(filename)
 
-    # YYYY-MM-DD
     iso = re.findall(r"(\d{4}-\d{2}-\d{2})", name)
     if iso:
         return iso[-1]
 
-    # DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY
     br = re.findall(r"(\d{2})[\/\-\._](\d{2})[\/\-\._](\d{4})", name)
     if br:
         dd, mm, yyyy = br[-1]
@@ -127,7 +125,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     ✅ Corrige "anúncios irmãos":
       - Estoque NÃO soma (estoque é compartilhado) -> MAX
-      - Preço ref = preço mínimo (preço de guerra)
+      - Preço ref = preço mínimo (guerra)
       - Cria anuncios_irmaos
       - Guarda preco_min/preco_max/preco_wavg
     """
@@ -154,10 +152,8 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         s = str(v).strip()
         if s == "" or s.lower() == "nan":
             return None
-        # 123.0 -> 123
         if re.fullmatch(r"\d+\.0", s):
             s = s[:-2]
-        # scientific notation
         if "e+" in s.lower():
             try:
                 s = str(int(float(s)))
@@ -203,8 +199,8 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         .agg(
             titulo=("titulo", first_non_null),
             marca=("marca", first_non_null),
-            estoque=("estoque", "max"),         # ✅ NÃO soma
-            vendas_unid=("vendas_unid", "sum"), # soma demanda
+            estoque=("estoque", "max"),          # ✅ NÃO soma
+            vendas_unid=("vendas_unid", "sum"),
             preco_min=("preco_medio", "min"),
             preco_max=("preco_medio", "max"),
             desconto=("desconto", mode_or_na),
@@ -215,24 +211,20 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         )
     )
 
-    price_wavg_map = df.groupby("key").apply(wavg_price)
+    # evita warning do groupby.apply
+    price_wavg_map = df.groupby("key", group_keys=False).apply(wavg_price)
     out["preco_wavg"] = out["key"].map(price_wavg_map)
 
-    # ✅ Preço de referência para competir: o menor preço (guerra)
-    out["preco_ref"] = out["preco_min"]
-
-    out = out.sort_values(["vendas_unid", "estoque"], ascending=[False, True], na_position="last")
+    out["preco_ref"] = out["preco_min"]  # preço de guerra
     return out
 
 
 # =========================
-# Diff / Ataque
+# Diff / Sinais
 # =========================
-def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame,
-                 stock_crit_max: int,
-                 stock_drop_pct_min: float,
-                 price_up_min: float):
+def compute_signals(prev: pd.DataFrame, curr: pd.DataFrame):
     merged = curr.merge(prev, on="key", how="inner", suffixes=("_new", "_old"))
+    common = len(merged)
 
     # preço ref (%)
     denom_p = merged["preco_ref_old"].where(merged["preco_ref_old"].notna() & (merged["preco_ref_old"] != 0), pd.NA)
@@ -244,14 +236,6 @@ def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame,
     pct_change_estoque = (merged["estoque_new"] - merged["estoque_old"]) / denom_e * 100.0
     merged["pct_drop_estoque"] = pct_change_estoque.apply(lambda v: (-v) if pd.notna(v) and v < 0 else 0.0)
 
-    # ✅ regra de ataque (MESMO concorrente, comparando com upload anterior)
-    merged["flag_ataque"] = (
-        (merged["delta_estoque"].fillna(0) < 0) &
-        (merged["pct_drop_estoque"].fillna(0) >= stock_drop_pct_min) &
-        (merged["estoque_new"].fillna(10**9) <= stock_crit_max) &
-        (merged["pct_change_preco_ref"].fillna(-10**9) >= price_up_min)
-    )
-
     out = merged[[
         "key",
         "titulo_new", "marca_new",
@@ -261,35 +245,37 @@ def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame,
         "preco_min_old", "preco_min_new",
         "preco_max_old", "preco_max_new",
         "preco_wavg_old", "preco_wavg_new",
-        "flag_ataque"
     ]].copy()
 
     out = out.rename(columns={"titulo_new": "titulo", "marca_new": "marca"})
-    return out
+    return out, common
 
 
-def build_score_row(row, stock_crit_max, stock_drop_pct_min, price_up_min):
-    pct_up = float(row.get("alta_preco_ref_pct_max")) if pd.notna(row.get("alta_preco_ref_pct_max")) else 0.0
-    drop = float(row.get("queda_estoque_pct_max")) if pd.notna(row.get("queda_estoque_pct_max")) else 0.0
-    conc = int(row.get("conc_ataque")) if pd.notna(row.get("conc_ataque")) else 0
-    est = float(row.get("estoque_atual")) if pd.notna(row.get("estoque_atual")) else stock_crit_max
-
-    s1 = (pct_up / max(price_up_min, 1e-9)) if price_up_min > 0 else 0.0
-    s2 = (drop / max(stock_drop_pct_min, 1e-9)) if stock_drop_pct_min > 0 else 0.0
-    s3 = 0.6 * max(0, conc - 1)
-    s4 = 0.8 * (1.0 - min(est / max(stock_crit_max, 1e-9), 1.0)) if stock_crit_max > 0 else 0.0
-    return round(s1 + s2 + s3 + s4, 3)
-
-
-def style_aggressive(df: pd.DataFrame):
+def style_green(df: pd.DataFrame, score_col: str = "score"):
     def row_style(row):
-        score = float(row.get("score")) if pd.notna(row.get("score")) else 0.0
-        # começa a pintar a partir de ~1.2
-        alpha = min(0.75, max(0.0, (score - 1.2) * 0.22))
+        v = row.get(score_col)
+        try:
+            v = float(v)
+        except:
+            v = 0.0
+        alpha = min(0.75, max(0.0, (v - 1.0) * 0.25))
         if alpha <= 0:
             return [""] * len(row)
         return [f"background-color: rgba(0, 200, 0, {alpha})"] * len(row)
     return df.style.apply(row_style, axis=1)
+
+
+def score_row(row, stock_drop_pct_min, price_up_min, stock_crit_max, require_crit):
+    pct_up = float(row.get("pct_change_preco_ref")) if pd.notna(row.get("pct_change_preco_ref")) else 0.0
+    drop = float(row.get("pct_drop_estoque")) if pd.notna(row.get("pct_drop_estoque")) else 0.0
+    est = float(row.get("estoque_new")) if pd.notna(row.get("estoque_new")) else 10**9
+
+    s1 = pct_up / max(price_up_min, 1e-9) if price_up_min > 0 else 0.0
+    s2 = drop / max(stock_drop_pct_min, 1e-9) if stock_drop_pct_min > 0 else 0.0
+    s3 = 0.0
+    if require_crit and stock_crit_max > 0:
+        s3 = 0.8 * (1.0 - min(est / max(stock_crit_max, 1e-9), 1.0))
+    return round(s1 + s2 + s3, 3)
 
 
 # =========================
@@ -299,19 +285,22 @@ tab_bi, tab_ctrl = st.tabs(["📌 BI (Clean)", "🧾 Controle (histórico)"])
 
 with tab_bi:
     st.subheader("Regras (você controla aqui)")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        stock_crit_max = st.number_input("Estoque crítico (≤)", 0, 10000, 20, 1)
-    with c2:
-        stock_drop_pct_min = st.number_input("Queda mínima do estoque (%)", 0.0, 100.0, 25.0, 1.0)
-    with c3:
-        price_up_min = st.number_input("Alta mínima do preço (%)", 0.0, 200.0, 10.0, 1.0)
-    with c4:
-        min_concorrentes = st.number_input("Exigir sinal em quantos concorrentes?", 1, 3, 2, 1)
-    with c5:
-        top_n = st.number_input("Mostrar TOP N", 5, 200, 30, 5)
+    c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,1,1])
 
-    st.caption("ATAQUE = estoque caiu forte + ficou crítico + preço (ref = preço mínimo) subiu forte, comparando SEMPRE com o último upload anterior do mesmo concorrente.")
+    with c1:
+        stock_crit_max = st.number_input("Estoque crítico (≤)", 0, 10000, 30, 1)
+    with c2:
+        require_crit = st.checkbox("Exigir estoque crítico no ATAQUE", value=False)
+    with c3:
+        stock_drop_pct_min = st.number_input("Queda mínima estoque (%)", 0.0, 100.0, 10.0, 1.0)
+    with c4:
+        price_up_min = st.number_input("Alta mínima preço (%)", 0.0, 200.0, 5.0, 1.0)
+    with c5:
+        min_concorrentes = st.number_input("Sinal em quantos concorrentes?", 1, 3, 1, 1)
+    with c6:
+        top_n = st.number_input("Mostrar TOP N", 5, 200, 40, 5)
+
+    st.caption("⚠️ Se não aparecer ATAQUE, o app agora ainda te mostra os CANDIDATOS: estoque caindo + preço subindo.")
 
     st.divider()
     st.subheader("Upload (3 arquivos do Nubmetrics)")
@@ -334,7 +323,9 @@ with tab_bi:
             st.error(f"Faltou upload: {', '.join(missing)}")
             st.stop()
 
-        per_comp = {}
+        comp_debug = []
+        all_candidates = []
+
         for comp, f in u.items():
             df_raw = pd.read_excel(f)
             df = normalize_df(df_raw)
@@ -343,75 +334,129 @@ with tab_bi:
             if not snap:
                 snap = fallback_date_str
 
-            # ✅ pega o último snapshot ANTES de salvar o atual
             prev_pack = load_last_snapshot(comp)
             prev_df = prev_pack["df"] if prev_pack else None
 
-            # salva o atual
+            # salva atual
             save_snapshot(comp, snap, f.name, df)
 
             if prev_df is None:
-                per_comp[comp] = {"prev_exists": False, "diff": pd.DataFrame()}
-            else:
-                prev_df = normalize_df(prev_df)
-                diff = compute_diff(prev_df, df, stock_crit_max, stock_drop_pct_min, price_up_min)
-                diff["concorrente"] = comp
-                diff["data"] = snap
-                per_comp[comp] = {"prev_exists": True, "diff": diff}
+                comp_debug.append({
+                    "concorrente": comp,
+                    "comparou_com": "— (primeiro upload)",
+                    "itens_em_comum": 0,
+                    "itens_no_upload": len(df)
+                })
+                continue
 
-        diffs = []
-        for comp in COMPETITORS:
-            d = per_comp.get(comp)
-            if d and d.get("prev_exists"):
-                diffs.append(d["diff"][d["diff"]["flag_ataque"] == True].copy())
+            prev_df = normalize_df(prev_df)
+            signals, common = compute_signals(prev_df, df)
+
+            comp_debug.append({
+                "concorrente": comp,
+                "comparou_com": f'{prev_pack["snapshot_date"]} ({prev_pack["filename"]})',
+                "itens_em_comum": int(common),
+                "itens_no_upload": int(len(df))
+            })
+
+            if common == 0:
+                continue
+
+            # filtros básicos (candidatos)
+            signals["flag_preco_up"] = signals["pct_change_preco_ref"].fillna(-10**9) >= price_up_min
+            signals["flag_estoque_drop"] = (signals["delta_estoque"].fillna(0) < 0) & (signals["pct_drop_estoque"].fillna(0) >= stock_drop_pct_min)
+            signals["flag_critico"] = signals["estoque_new"].fillna(10**9) <= stock_crit_max if stock_crit_max > 0 else True
+
+            # ATAQUE “formal”
+            if require_crit:
+                signals["flag_ataque"] = signals["flag_preco_up"] & signals["flag_estoque_drop"] & signals["flag_critico"]
+            else:
+                signals["flag_ataque"] = signals["flag_preco_up"] & signals["flag_estoque_drop"]
+
+            # score e guarda
+            signals["score"] = signals.apply(lambda r: score_row(r, stock_drop_pct_min, price_up_min, stock_crit_max, require_crit), axis=1)
+            signals["concorrente"] = comp
+            signals["data"] = snap
+
+            # candidatos = caiu estoque + subiu preço (mesmo se não for “critico”)
+            cand = signals[signals["flag_preco_up"] & signals["flag_estoque_drop"]].copy()
+            all_candidates.append(cand)
 
         st.divider()
-        st.subheader("🎯 Produtos para ATACAR (BI CLEAN)")
+        st.subheader("🔍 Debug rápido (pra você ter certeza que comparou)")
+        st.dataframe(pd.DataFrame(comp_debug), use_container_width=True, height=220)
 
-        if not diffs:
-            st.info("Agora você já criou o baseline. Sobe os 3 arquivos de novo (pode ser AGORA mesmo) que ele compara com o upload anterior e mostra o BI.")
+        if not all_candidates:
+            st.warning("Não teve itens em comum para comparar (keys não bateram). Isso só acontece se o arquivo veio diferente/sem SKU/GTIN. Me manda 1 export que eu ajusto o key.")
             st.stop()
 
-        ataques_all = pd.concat(diffs, ignore_index=True)
+        candidates_all = pd.concat(all_candidates, ignore_index=True)
+        if candidates_all.empty:
+            st.warning("Comparou, mas não achou NENHUM candidato (estoque caiu + preço subiu) com os thresholds atuais. Baixa mais as % e tenta de novo.")
+            st.stop()
 
+        # resumo por produto cruzando concorrentes
         resumo = (
-            ataques_all.groupby(["key", "titulo", "marca"], as_index=False)
+            candidates_all.groupby(["key", "titulo", "marca"], as_index=False)
             .agg(
-                conc_ataque=("concorrente", "nunique"),
+                conc=("concorrente", "nunique"),
                 concorrentes=("concorrente", lambda x: ", ".join(sorted(set(x)))),
                 anuncios_irmaos=("anuncios_irmaos_new", "max"),
-                estoque_atual=("estoque_new", "min"),
+                estoque_min=("estoque_new", "min"),
                 queda_estoque_pct_max=("pct_drop_estoque", "max"),
+                alta_preco_ref_pct_max=("pct_change_preco_ref", "max"),
                 preco_ref_antes=("preco_ref_old", "min"),
                 preco_ref_agora=("preco_ref_new", "max"),
-                alta_preco_ref_pct_max=("pct_change_preco_ref", "max"),
-                preco_min_agora=("preco_min_new", "min"),
-                preco_max_agora=("preco_max_new", "max"),
-                preco_wavg_agora=("preco_wavg_new", "max"),
             )
         )
 
-        if min_concorrentes > 1:
-            resumo = resumo[resumo["conc_ataque"] >= int(min_concorrentes)]
-
+        resumo = resumo[resumo["conc"] >= int(min_concorrentes)]
         if resumo.empty:
-            st.warning("Com as regras atuais, não apareceu nada forte em concorrentes suficientes. Abaixa as % ou exige menos concorrentes.")
+            st.warning("Teve candidatos, mas não bateu o número mínimo de concorrentes exigido. Baixa esse número.")
             st.stop()
 
-        resumo["score"] = resumo.apply(
-            lambda r: build_score_row(r, stock_crit_max, stock_drop_pct_min, price_up_min),
-            axis=1
-        )
-        resumo = resumo.sort_values(["score", "conc_ataque", "estoque_atual"], ascending=[False, False, True]).head(int(top_n))
+        # score final
+        resumo["score"] = (
+            (resumo["alta_preco_ref_pct_max"] / max(price_up_min, 1e-9)) +
+            (resumo["queda_estoque_pct_max"] / max(stock_drop_pct_min, 1e-9)) +
+            (1.2 * (resumo["conc"] - 1))
+        ).round(3)
 
-        st.dataframe(style_aggressive(resumo), use_container_width=True, height=560)
+        resumo = resumo.sort_values(["score", "conc", "estoque_min"], ascending=[False, False, True]).head(int(top_n))
+
+        st.subheader("🎯 Produtos pra ATACAR (candidatos: estoque caiu + preço subiu)")
+        st.dataframe(style_green(resumo, "score"), use_container_width=True, height=560)
 
         st.download_button(
-            "Baixar TOP ATAQUES (CSV)",
+            "Baixar TOP Candidatos (CSV)",
             resumo.to_csv(index=False).encode("utf-8"),
-            file_name=f"top_ataques_{fallback_date_str}.csv",
+            file_name=f"top_candidatos_{fallback_date_str}.csv",
             mime="text/csv"
         )
+
+        # extras: sempre mostrar “top estoque caiu” e “top preço subiu”
+        st.divider()
+        st.subheader("📉 Top quedas de estoque (mesmo que preço não suba)")
+        top_stock = candidates_all.sort_values(["pct_drop_estoque", "delta_estoque"], ascending=[False, True]).head(30)
+        st.dataframe(top_stock[[
+            "concorrente","key","titulo","marca",
+            "estoque_old","estoque_new","delta_estoque","pct_drop_estoque",
+            "preco_ref_old","preco_ref_new","pct_change_preco_ref",
+            "anuncios_irmaos_new"
+        ]], use_container_width=True, height=420)
+
+        st.subheader("📈 Top altas de preço (mesmo que estoque não caia)")
+        # usa signals “bruto”: pega do candidates_all só quem tem colunas (já tem),
+        # mas aqui quer qualquer alta → então recria a partir dos candidatos_all (que já é subset)
+        # (se quiser 100% completo, depois eu amplio para puxar todos os signals)
+        top_price = candidates_all.sort_values(["pct_change_preco_ref"], ascending=[False]).head(30)
+        st.dataframe(top_price[[
+            "concorrente","key","titulo","marca",
+            "preco_ref_old","preco_ref_new","pct_change_preco_ref",
+            "estoque_old","estoque_new","delta_estoque","pct_drop_estoque",
+            "anuncios_irmaos_new"
+        ]], use_container_width=True, height=420)
+
 
 with tab_ctrl:
     st.subheader("Histórico do que já foi enviado")
@@ -420,7 +465,7 @@ with tab_ctrl:
 
     st.markdown("### Diagnóstico rápido")
     if snaps.empty:
-        st.error("Seu banco está vazio. Sobe os 3 arquivos 1x pra criar baseline, depois sobe de novo pra comparar.")
+        st.error("Banco vazio. Sobe os 3 arquivos 1x pra criar baseline, depois sobe o próximo pra comparar.")
     else:
         st.success(f"Banco OK: {len(snaps)} snapshots salvos.")
         byc = snaps.groupby("competitor").size().reset_index(name="qtd")
