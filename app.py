@@ -14,7 +14,6 @@ DB_PATH = os.environ.get("DB_PATH", "/tmp/purehome_snapshots.db")
 
 COMPETITORS = ["AUMA", "BAGATELLE", "PERFUMES_BHZ"]
 
-# Nubmetrics -> nomes canônicos
 CANON_MAP = {
     "título": "titulo",
     "titulo": "titulo",
@@ -116,10 +115,6 @@ def wipe_db():
 # Utils
 # ======================
 def parse_date_from_filename(name: str):
-    """
-    Tenta achar data no nome do arquivo.
-    Aceita: 2025-12-21 | 20251221 | 21-12-2025 | 21_12_2025 | 21.12.2025
-    """
     if not name:
         return None
 
@@ -179,28 +174,67 @@ def safe_pct_drop(old, new):
     except Exception:
         return pd.NA
 
+
+def fmt_brl_money(v):
+    if pd.isna(v):
+        return ""
+    try:
+        v = float(v)
+    except Exception:
+        return ""
+    # 2 casas, mas remove zeros desnecessários
+    s = f"{v:,.2f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # pt-BR
+    if s.endswith(",00"):
+        s = s[:-3]
+    return f"R$ {s}"
+
+
+def fmt_pct_signed(v, force_minus=False):
+    """
+    v em número (ex 8.24) => +8,24%
+    se force_minus=True => -8,24% (para quedas)
+    """
+    if pd.isna(v):
+        return ""
+    try:
+        v = float(v)
+    except Exception:
+        return ""
+    sign = "-" if force_minus else ("+" if v > 0 else ("-" if v < 0 else ""))
+    vv = abs(v) if force_minus else abs(v)
+    s = f"{vv:.2f}".replace(".", ",")
+    if s.endswith(",00"):
+        s = s[:-3]
+    return f"{sign}{s}%"
+
+
+def fmt_int(v):
+    if pd.isna(v):
+        return ""
+    try:
+        return str(int(round(float(v))))
+    except Exception:
+        return ""
+
 # ======================
 # Normalize + agregação por SKU (anúncios irmãos)
 # ======================
 def normalize_and_aggregate(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
 
-    # normaliza colunas
     df.columns = [str(c).strip().lower() for c in df.columns]
     df = df.rename(columns={c: CANON_MAP.get(c, c) for c in df.columns})
 
-    # garante colunas
     for c in ["sku", "gtin", "n_peca", "titulo", "marca", "preco_medio", "estoque", "vendas_unid",
               "desconto", "frete_gratis", "full", "tipo_publicacao"]:
         if c not in df.columns:
             df[c] = pd.NA
 
-    # tipos
     df["preco_medio"] = pd.to_numeric(df["preco_medio"], errors="coerce")
     df["estoque"] = pd.to_numeric(df["estoque"], errors="coerce")
     df["vendas_unid"] = pd.to_numeric(df["vendas_unid"], errors="coerce")
 
-    # key: prioriza SKU; se não tiver, GTIN; depois N° peça; fallback título
     def make_key(row):
         for k in ["sku", "gtin", "n_peca"]:
             v = row.get(k)
@@ -214,7 +248,6 @@ def normalize_and_aggregate(raw: pd.DataFrame) -> pd.DataFrame:
     df["key"] = df.apply(make_key, axis=1)
     df = df[df["key"].notna()].copy()
 
-    # flags "Sim/Não"
     for b in ["desconto", "frete_gratis", "full"]:
         df[b] = df[b].apply(to_bool_sim_na)
 
@@ -224,16 +257,13 @@ def normalize_and_aggregate(raw: pd.DataFrame) -> pd.DataFrame:
             return pd.NA
         return s.mode().iloc[0]
 
-    # AGREGAÇÃO:
-    # - preço_ref = MIN (preço mais baixo entre anúncios irmãos)
-    # - estoque_ref = MAX (não soma estoque; evita falso alerta)
-    # - anuncios_irmaos = count
+    # IMPORTANTE:
+    # - NÃO somar estoque (anúncios irmãos compartilham estoque)
+    # - preço referência = preço MIN (mais barato)
     agg = df.groupby("key", as_index=False).agg(
         titulo=("titulo", lambda s: s.dropna().iloc[0] if len(s.dropna()) else pd.NA),
         marca=("marca", lambda s: s.dropna().iloc[0] if len(s.dropna()) else pd.NA),
         preco_ref=("preco_medio", "min"),
-        preco_max=("preco_medio", "max"),
-        preco_med=("preco_medio", "median"),
         estoque_ref=("estoque", "max"),
         vendas_unid=("vendas_unid", "sum"),
         desconto=("desconto", "max"),
@@ -243,7 +273,6 @@ def normalize_and_aggregate(raw: pd.DataFrame) -> pd.DataFrame:
         anuncios_irmaos=("key", "size"),
     )
 
-    # título do anúncio mais barato
     cheap_title = (
         df.sort_values(["key", "preco_medio"], ascending=[True, True], na_position="last")
           .drop_duplicates("key")[["key", "titulo"]]
@@ -262,10 +291,10 @@ def normalize_and_aggregate(raw: pd.DataFrame) -> pd.DataFrame:
 def compare(prev_norm: pd.DataFrame, curr_norm: pd.DataFrame):
     merged = curr_norm.merge(prev_norm, on="key", how="inner", suffixes=("_new", "_old"))
 
-    merged["pct_change_preco_ref"] = merged.apply(
+    merged["preco_pct"] = merged.apply(
         lambda r: safe_pct_change(r["preco_ref_new"], r["preco_ref_old"]), axis=1
     )
-    merged["pct_drop_estoque_ref"] = merged.apply(
+    merged["estoque_drop_pct"] = merged.apply(
         lambda r: safe_pct_drop(r["estoque_ref_old"], r["estoque_ref_new"]), axis=1
     )
 
@@ -273,18 +302,16 @@ def compare(prev_norm: pd.DataFrame, curr_norm: pd.DataFrame):
         "key",
         "titulo_new", "marca_new",
         "anuncios_irmaos_new",
-        "preco_ref_old", "preco_ref_new", "pct_change_preco_ref",
-        "estoque_ref_old", "estoque_ref_new", "pct_drop_estoque_ref",
+        "preco_ref_old", "preco_ref_new", "preco_pct",
+        "estoque_ref_old", "estoque_ref_new", "estoque_drop_pct",
     ]].rename(columns={
         "titulo_new": "titulo",
         "marca_new": "marca",
         "anuncios_irmaos_new": "anuncios_irmaos",
         "preco_ref_old": "preco_old",
         "preco_ref_new": "preco_new",
-        "pct_change_preco_ref": "preco_pct",
         "estoque_ref_old": "estoque_old",
         "estoque_ref_new": "estoque_new",
-        "pct_drop_estoque_ref": "estoque_drop_pct",
     })
 
     return out, len(merged), len(curr_norm), len(prev_norm)
@@ -320,8 +347,6 @@ with tab_bi:
     )
 
     st.divider()
-    st.markdown("Offer: suba o export de 'Últimos 7 dias' (um arquivo por concorrente). O app compara o upload de hoje contra o upload anterior.")
-
     st.markdown("### Upload (3 arquivos do Nubmetrics)")
     auto_date = st.checkbox("Tentar pegar a data automaticamente do nome do arquivo", value=True)
     snap_date_manual = st.date_input("Se não achar no nome, usa esta data do snapshot", value=date.today())
@@ -355,22 +380,20 @@ with tab_bi:
 
             prev_pack = load_last_snapshot_before(comp, snap_date_str)
 
-            # salva SEMPRE o atual (já agregado)
+            # salva o atual (já agregado)
             save_snapshot(comp, snap_date_str, f.name, curr_norm)
 
             if not prev_pack:
                 per_comp[comp] = {"prev": None, "curr": curr_norm, "cmp": None, "common": 0}
                 debug_rows.append({
-                    "concorrente": comp,
-                    "comparou_com": "— (primeiro upload)",
-                    "itens_em_comum": 0,
-                    "itens_no_upload": len(curr_norm)
+                    "Concorrente": comp,
+                    "Comparou com": "— (primeiro upload)",
+                    "Itens em comum": 0,
+                    "Itens no upload": len(curr_norm)
                 })
                 continue
 
-            prev_norm = prev_pack["df"]
-
-            # BUG FIX: NÃO normaliza novamente o anterior
+            prev_norm = prev_pack["df"]  # BUG FIX: não re-normaliza
             cmp_df, common, n_curr, _n_prev = compare(prev_norm, curr_norm)
 
             per_comp[comp] = {
@@ -383,10 +406,10 @@ with tab_bi:
             }
 
             debug_rows.append({
-                "concorrente": comp,
-                "comparou_com": f'{prev_pack["snapshot_date"]} ({prev_pack["filename"]})',
-                "itens_em_comum": common,
-                "itens_no_upload": n_curr
+                "Concorrente": comp,
+                "Comparou com": f'{prev_pack["snapshot_date"]} ({prev_pack["filename"]})',
+                "Itens em comum": common,
+                "Itens no upload": n_curr
             })
 
         st.markdown("#### 🔎 Debug rápido (pra você ter certeza que comparou)")
@@ -419,37 +442,57 @@ with tab_bi:
 
         all_cmp = pd.concat(frames, ignore_index=True)
 
+        # Estoque por concorrente (pra você bater o olho)
+        stock_by_comp = (
+            all_cmp.groupby(["key", "concorrente"], as_index=False)
+                  .agg(estoque=("estoque_new", "min"))
+        )
+        stock_pivot = stock_by_comp.pivot(index="key", columns="concorrente", values="estoque").reset_index()
+
+        def join_stocks(row):
+            parts = []
+            for c in COMPETITORS:
+                v = row.get(c)
+                if pd.isna(v):
+                    parts.append(f"{c}:-")
+                else:
+                    parts.append(f"{c}:{fmt_int(v)}")
+            return " | ".join(parts)
+
+        stock_pivot["estoques_concorrentes"] = stock_pivot.apply(join_stocks, axis=1)
+        stock_pivot = stock_pivot[["key", "estoques_concorrentes"]]
+
         g = (
             all_cmp.groupby("key", as_index=False)
                   .agg(
                       titulo=("titulo", "first"),
                       marca=("marca", "first"),
                       concorrentes_com_sinal=("flag_ataque", "sum"),
-                      concorrentes_no_total=("concorrente", "nunique"),
-                      estoque_min=("estoque_new", "min"),
-                      estoque_med=("estoque_new", "median"),
+                      estoque_atual_min=("estoque_new", "min"),
                       queda_estoque_pct_max=("estoque_drop_pct", "max"),
-                      preco_old_min=("preco_old", "min"),
-                      preco_new_min=("preco_new", "min"),
-                      preco_pct_max=("preco_pct", "max"),
+                      preco_anterior_min=("preco_old", "min"),
+                      preco_atual_min=("preco_new", "min"),
+                      variacao_preco_pct_max=("preco_pct", "max"),
                       anuncios_irmaos_max=("anuncios_irmaos", "max"),
                   )
         )
 
+        g = g.merge(stock_pivot, on="key", how="left")
+
         atacar = g[g["concorrentes_com_sinal"] >= int(min_concorrentes)].copy()
 
         if atacar.empty:
-            st.warning("Nada bateu ATAQUE com as regras atuais. Vou te mostrar CANDIDATOS (estoque caindo + preço subindo) pra você agir mesmo assim.")
+            st.warning("Nada bateu ATAQUE com as regras atuais. Vou te mostrar CANDIDATOS (estoque caindo + preço subindo).")
             atacar = g[
                 (g["queda_estoque_pct_max"].fillna(-10**9) >= float(queda_min_estoque_pct)) &
-                (g["preco_pct_max"].fillna(-10**9) >= float(alta_min_preco_pct))
+                (g["variacao_preco_pct_max"].fillna(-10**9) >= float(alta_min_preco_pct))
             ].copy()
 
         atacar["score"] = (
             atacar["concorrentes_com_sinal"].fillna(0) * 100
             + atacar["queda_estoque_pct_max"].fillna(0) * 2
-            + atacar["preco_pct_max"].fillna(0) * 1
-            - atacar["estoque_min"].fillna(0) * 0.5
+            + atacar["variacao_preco_pct_max"].fillna(0) * 1
+            - atacar["estoque_atual_min"].fillna(0) * 0.5
         )
 
         atacar = (
@@ -458,58 +501,113 @@ with tab_bi:
                   .drop(columns=["score"])
         )
 
-        def style_rows(row):
-            q_drop = float(atacar["queda_estoque_pct_max"].quantile(0.75)) if len(atacar) >= 4 else 20.0
-            q_price = float(atacar["preco_pct_max"].quantile(0.75)) if len(atacar) >= 4 else 10.0
+        # ======================
+        # APRESENTAÇÃO CLEAN
+        # ======================
+        st.markdown("### 🎯 Produtos para ATACAR (BI CLEAN)")
+
+        show = atacar[[
+            "key",
+            "titulo",
+            "marca",
+            "concorrentes_com_sinal",
+            "estoque_atual_min",
+            "estoques_concorrentes",
+            "queda_estoque_pct_max",
+            "preco_anterior_min",
+            "preco_atual_min",
+            "variacao_preco_pct_max",
+            "anuncios_irmaos_max",
+        ]].copy()
+
+        # renomeia colunas (claras)
+        col_rename = {
+            "key": "SKU / ID",
+            "titulo": "Produto",
+            "marca": "Marca",
+            "concorrentes_com_sinal": "Concorrentes c/ sinal",
+            "estoque_atual_min": "Estoque atual (mín)",
+            "estoques_concorrentes": "Estoques por concorrente",
+            "queda_estoque_pct_max": "Queda estoque",
+            "preco_anterior_min": "Preço anterior",
+            "preco_atual_min": "Preço atual",
+            "variacao_preco_pct_max": "Variação preço",
+            "anuncios_irmaos_max": "Anúncios irmãos",
+        }
+        show = show.rename(columns=col_rename)
+
+        # formata textos (percent e R$) mantendo colunas numéricas separadas pra estilo
+        # vamos criar colunas "display" e manter as originais só pra style
+        show["_drop_num"] = atacar["queda_estoque_pct_max"].values
+        show["_price_num"] = atacar["variacao_preco_pct_max"].values
+
+        show["Queda estoque"] = show["_drop_num"].apply(lambda v: fmt_pct_signed(v, force_minus=True))
+        show["Variação preço"] = show["_price_num"].apply(lambda v: fmt_pct_signed(v, force_minus=False))
+
+        show["Preço anterior"] = show["Preço anterior"].apply(fmt_brl_money)
+        show["Preço atual"] = show["Preço atual"].apply(fmt_brl_money)
+
+        show["Estoque atual (mín)"] = show["Estoque atual (mín)"].apply(fmt_int)
+        show["Concorrentes c/ sinal"] = show["Concorrentes c/ sinal"].apply(fmt_int)
+        show["Anúncios irmãos"] = show["Anúncios irmãos"].apply(fmt_int)
+
+        # === estilos: queda vermelho negrito, alta verde negrito
+        def style_pct(row):
+            styles = [""] * len(row)
+            cols = list(row.index)
+
+            # queda (vermelho)
+            if "Queda estoque" in cols:
+                i = cols.index("Queda estoque")
+                if pd.notna(row.get("_drop_num")) and row.get("_drop_num") > 0:
+                    styles[i] = "color:#b00020;font-weight:700;"
+            # variação preço (verde ou vermelho)
+            if "Variação preço" in cols:
+                i = cols.index("Variação preço")
+                v = row.get("_price_num")
+                if pd.isna(v):
+                    pass
+                else:
+                    if float(v) > 0:
+                        styles[i] = "color:#0a7a0a;font-weight:700;"
+                    elif float(v) < 0:
+                        styles[i] = "color:#b00020;font-weight:700;"
+            return styles
+
+        def highlight_strong(row):
+            # verde clarinho nas mudanças mais agressivas
+            # (top 25% de queda de estoque + top 25% de alta de preço)
+            if len(show) < 4:
+                return [""] * len(row)
+
+            q_drop = float(atacar["queda_estoque_pct_max"].quantile(0.75))
+            q_price = float(atacar["variacao_preco_pct_max"].quantile(0.75))
+
             strong = (
-                pd.notna(row["queda_estoque_pct_max"]) and row["queda_estoque_pct_max"] >= q_drop
-                and pd.notna(row["preco_pct_max"]) and row["preco_pct_max"] >= q_price
+                pd.notna(row.get("_drop_num")) and float(row.get("_drop_num")) >= q_drop
+                and pd.notna(row.get("_price_num")) and float(row.get("_price_num")) >= q_price
             )
             if strong:
-                return ["background-color: #d8f5d8"] * len(row)  # verde clarinho
+                return ["background-color:#d8f5d8;"] * len(row)
             return [""] * len(row)
 
-        st.markdown("### 🎯 Produtos para ATACAR (BI CLEAN)")
-        show_cols = [
-            "key", "titulo", "marca",
-            "concorrentes_com_sinal",
-            "estoque_min", "queda_estoque_pct_max",
-            "preco_old_min", "preco_new_min", "preco_pct_max",
-            "anuncios_irmaos_max",
-        ]
-        atacar_show = atacar[show_cols].copy()
+        # remove colunas auxiliares da visão final, mas mantém pra style via row.get
+        # (o pandas styler ainda "vê" elas se estiverem no df; então deixamos e escondemos)
+        styled = (
+            show.style
+                .apply(highlight_strong, axis=1)
+                .apply(style_pct, axis=1)
+                .hide(axis="columns", subset=["_drop_num", "_price_num"])
+        )
 
-        for c in ["estoque_min", "anuncios_irmaos_max"]:
-            atacar_show[c] = atacar_show[c].round(0)
-        for c in ["queda_estoque_pct_max", "preco_pct_max"]:
-            atacar_show[c] = atacar_show[c].round(2)
-        for c in ["preco_old_min", "preco_new_min"]:
-            atacar_show[c] = atacar_show[c].round(2)
-
-        st.dataframe(atacar_show.style.apply(style_rows, axis=1), use_container_width=True, height=520)
+        st.dataframe(styled, use_container_width=True, height=520)
 
         st.download_button(
             "Baixar BI (CSV)",
-            atacar_show.to_csv(index=False).encode("utf-8"),
+            show.drop(columns=["_drop_num", "_price_num"]).to_csv(index=False).encode("utf-8"),
             file_name=f"bi_clean_{snap_date_str_default}.csv",
             mime="text/csv"
         )
-
-        st.divider()
-        with st.expander("📎 Detalhe (por concorrente) — só se você quiser olhar"):
-            for comp in COMPETITORS:
-                pack = per_comp.get(comp, {})
-                st.markdown(f"#### {comp}")
-                if pack.get("prev") is None:
-                    st.info("Primeiro upload desse concorrente. No próximo já sai o comparativo.")
-                    continue
-                if pack.get("common", 0) == 0:
-                    st.warning("Não bateu key com o anterior.")
-                    continue
-
-                st.caption(f"Comparou com: {pack['prev_date']} ({pack['prev_file']})")
-                d = pack["cmp"].sort_values(["estoque_drop_pct", "preco_pct"], ascending=[False, False])
-                st.dataframe(d.head(30), use_container_width=True, height=360)
 
 with tab_hist:
     st.markdown("### Histórico de uploads")
