@@ -1,9 +1,7 @@
-
 import os
 import streamlit as st
 import pandas as pd
 import sqlite3
-import json
 from datetime import datetime, date
 
 DB_PATH = os.environ.get("DB_PATH", "/tmp/snapshots.db")
@@ -15,7 +13,7 @@ PRICE_ALERT_PCT = 10.0            # variação >= 10% (pra cima ou pra baixo)
 
 st.set_page_config(page_title="PureHome • Monitor Nubmetrics", layout="wide")
 st.title("PureHome • Monitor de Concorrentes (Nubmetrics)")
-st.caption("Upload diário de 3 planilhas → relatório de mudanças + oportunidades por estoque baixo (sem alertas externos).")
+st.caption("Upload diário de 3 planilhas → BI clean de ATAQUE + detalhes (opcional).")
 
 COMPETITORS = ["AUMA", "BAGATELLE", "PERFUMES_BHZ"]
 
@@ -60,24 +58,6 @@ def load_last_snapshot_before(competitor: str, snapshot_date: str):
     df = pd.read_json(data_json, orient="records")
     return d, uploaded_at, df
 
-def load_snapshot_exact(competitor: str, snapshot_date: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            """
-            SELECT snapshot_date, uploaded_at, filename, data_json
-            FROM snapshots
-            WHERE competitor = ? AND snapshot_date = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (competitor, snapshot_date)
-        ).fetchone()
-    if not row:
-        return None
-    d, uploaded_at, filename, data_json = row
-    df = pd.read_json(data_json, orient="records")
-    return {"snapshot_date": d, "uploaded_at": uploaded_at, "filename": filename, "df": df}
-
 # ---------- NORMALIZAÇÃO ----------
 CANON_MAP = {
     "título": "titulo",
@@ -117,7 +97,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip().lower() for c in df.columns]
     df = df.rename(columns={c: CANON_MAP.get(c, c) for c in df.columns})
 
-    # garante colunas esperadas (se não existir, cria)
+    # garante colunas esperadas
     for c in WATCH_COLS + ["sku", "gtin", "n_peca", "titulo", "marca"]:
         if c not in df.columns:
             df[c] = pd.NA
@@ -133,7 +113,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
             v = row.get(k)
             if pd.notna(v) and str(v).strip() != "":
                 return str(v).strip()
-        # fallback (pior caso)
         t = row.get("titulo")
         if pd.notna(t) and str(t).strip() != "":
             return "TIT_" + str(t).strip()[:80]
@@ -147,7 +126,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(by=["key", "vendas_unid"], ascending=[True, False], na_position="last")
     df = df.drop_duplicates(subset=["key"], keep="first")
 
-    # booleanos amigáveis
+    # booleanos amigáveis (mantém como string "Sim"/"Não" etc)
     for b in ["desconto", "frete_gratis", "full", "mercado_envios", "catalogo", "mercadopago"]:
         if b in df.columns:
             df[b] = df[b].astype(str).str.strip()
@@ -161,7 +140,6 @@ def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame):
 
     merged = curr.merge(prev, on="key", how="outer", suffixes=("_new", "_old"), indicator=True)
 
-    # itens novos / removidos
     added = merged[merged["_merge"] == "left_only"].copy()
     removed = merged[merged["_merge"] == "right_only"].copy()
     both = merged[merged["_merge"] == "both"].copy()
@@ -174,42 +152,59 @@ def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame):
         if newc not in both.columns or oldc not in both.columns:
             continue
 
-        # compara string p/ não errar por NaN
         diff_mask = both[newc].astype(str) != both[oldc].astype(str)
         if diff_mask.any():
             temp = both.loc[diff_mask, ["key", oldc, newc, "titulo_new", "marca_new"]].copy()
             temp["campo"] = col
-            temp.rename(columns={
-                oldc: "antes",
-                newc: "depois",
-                "titulo_new": "titulo",
-                "marca_new": "marca"
-            }, inplace=True)
+            temp.rename(columns={oldc: "antes", newc: "depois", "titulo_new": "titulo", "marca_new": "marca"}, inplace=True)
             changes.append(temp)
 
     changes_df = pd.concat(changes, ignore_index=True) if changes else pd.DataFrame(
         columns=["key", "antes", "depois", "titulo", "marca", "campo"]
     )
 
-    # métricas de preço (pct)
+    # métricas de preço (pct) com proteção contra divisão por zero
+    both["pct_change_preco"] = pd.NA
     if "preco_medio_new" in both.columns and "preco_medio_old" in both.columns:
-        both["pct_change_preco"] = (both["preco_medio_new"] - both["preco_medio_old"]) / both["preco_medio_old"] * 100.0
-    else:
-        both["pct_change_preco"] = pd.NA
+        denom = both["preco_medio_old"].copy()
+        denom = denom.where(denom.notna() & (denom != 0), pd.NA)
+        both["pct_change_preco"] = (both["preco_medio_new"] - both["preco_medio_old"]) / denom * 100.0
 
-    # alertas (por concorrente)
     both["alerta_preco"] = both["pct_change_preco"].abs() >= PRICE_ALERT_PCT
-    both["dir_preco"] = both["pct_change_preco"].apply(lambda x: "UP" if pd.notna(x) and x >= PRICE_ALERT_PCT else ("DOWN" if pd.notna(x) and x <= -PRICE_ALERT_PCT else "—"))
+    both["dir_preco"] = both["pct_change_preco"].apply(
+        lambda x: "UP" if pd.notna(x) and x >= PRICE_ALERT_PCT else ("DOWN" if pd.notna(x) and x <= -PRICE_ALERT_PCT else "—")
+    )
 
+    # estoque delta + flag_ataque (o que você pediu)
+    if "estoque_new" in both.columns and "estoque_old" in both.columns:
+        both["delta_estoque"] = both["estoque_new"] - both["estoque_old"]
+    else:
+        both["delta_estoque"] = pd.NA
+
+    both["flag_ataque"] = (
+        (both["delta_estoque"].fillna(0) < 0) &
+        (both["estoque_new"].fillna(10**9) <= STOCK_ALERT_MAX) &
+        (both["pct_change_preco"].fillna(-10**9) >= PRICE_ALERT_PCT)
+    )
+
+    # snapshot atual p/ alertas de estoque
     curr_alert = curr[["key", "titulo", "marca", "preco_medio", "estoque", "desconto", "frete_gratis", "full", "tipo_publicacao", "vendas_unid"]].copy()
     curr_alert["alerta_estoque"] = curr_alert["estoque"].fillna(10**9) <= STOCK_ALERT_MAX
 
-    return added, removed, changes_df, both[["key", "titulo_new", "marca_new", "preco_medio_old", "preco_medio_new", "pct_change_preco", "alerta_preco", "dir_preco"]], curr_alert
+    price_moves = both[[
+        "key",
+        "titulo_new", "marca_new",
+        "preco_medio_old", "preco_medio_new",
+        "pct_change_preco", "alerta_preco", "dir_preco",
+        "estoque_old", "estoque_new",
+        "delta_estoque", "flag_ataque"
+    ]].copy()
+
+    return added, removed, changes_df, price_moves, curr_alert
 
 # ---------- UI ----------
 st.subheader("1) Suba as 3 planilhas do dia")
-col1, col2 = st.columns([1, 2])
-with col1:
+with st.container():
     snap_date = st.date_input("Data do snapshot", value=date.today())
 snap_date_str = snap_date.isoformat()
 
@@ -219,30 +214,27 @@ for i, comp in enumerate(COMPETITORS):
     with u_cols[i]:
         uploaded_files[comp] = st.file_uploader(f"{comp} (Excel Nubmetrics)", type=["xlsx", "xls"], key=f"up_{comp}")
 
-process = st.button("Processar e gerar relatório", type="primary")
+process = st.button("Processar e gerar BI", type="primary")
 
 st.divider()
 st.subheader("2) Resultado")
 
 def show_card(title, df):
     st.markdown(f"### {title}")
-    st.dataframe(df, use_container_width=True, height=320)
+    st.dataframe(df, use_container_width=True, height=360)
 
 if process:
-    # valida uploads
     missing = [c for c, f in uploaded_files.items() if f is None]
     if missing:
         st.error(f"Faltou upload: {', '.join(missing)}")
         st.stop()
 
-    # processa cada concorrente
     per_comp = {}
     for comp, f in uploaded_files.items():
         df = pd.read_excel(f)
         df = normalize_df(df)
 
         prev_date, prev_uploaded_at, prev_df = load_last_snapshot_before(comp, snap_date_str)
-        # salva snapshot atual
         save_snapshot(comp, snap_date_str, f.name, df)
 
         if prev_df is None:
@@ -253,6 +245,7 @@ if process:
                 "removed": pd.DataFrame(),
                 "changes": pd.DataFrame(),
                 "price_moves": pd.DataFrame(),
+                "curr_alert": pd.DataFrame(),
                 "curr": df
             }
         else:
@@ -269,136 +262,109 @@ if process:
                 "curr": df
             }
 
-    # ---- INTELIGÊNCIA CROSS-CONCORRENTES ----
-    # Junta variação de preço (quando existe prev)
+    # ---- CROSS ----
     price_frames = []
-    stock_frames = []
     for comp, d in per_comp.items():
-        curr = d["curr"][["key", "titulo", "marca", "preco_medio", "estoque"]].copy()
-        curr["concorrente"] = comp
-        curr["estoque_alerta"] = curr["estoque"].fillna(10**9) <= STOCK_ALERT_MAX
-        stock_frames.append(curr)
-
         if d.get("prev_exists"):
             pm = d["price_moves"].copy()
-            pm.rename(columns={"titulo_new": "titulo", "marca_new": "marca"}, inplace=True)
             pm["concorrente"] = comp
             price_frames.append(pm)
 
-    stock_all = pd.concat(stock_frames, ignore_index=True)
-    # tabela de oportunidades por estoque (no dia)
-    stock_summary = (stock_all
-        .groupby("key", as_index=False)
-        .agg(
-            titulo=("titulo", "first"),
-            marca=("marca", "first"),
-            conc_criticos=("estoque_alerta", "sum"),
-            estoque_min=("estoque", "min"),
-            estoque_med=("estoque", "median"),
-        )
-    )
-    stock_summary["oportunidade_ataque"] = stock_summary["conc_criticos"] >= 2
+    # ---------- BI CLEAN: ATAQUES ----------
+    st.markdown("## 🎯 ATAQUES do dia (estoque caiu + estoque ≤20 + preço subiu ≥10%)")
 
-    # tabela de movimentos coordenados de preço (precisa de prev)
-    if price_frames:
-        price_all = pd.concat(price_frames, ignore_index=True)
-        coord = (price_all
-            .groupby("key", as_index=False)
-            .agg(
-                titulo=("titulo", "first"),
-                marca=("marca", "first"),
-                up_count=("dir_preco", lambda s: (s == "UP").sum()),
-                down_count=("dir_preco", lambda s: (s == "DOWN").sum()),
-                any_alert=("alerta_preco", "sum"),
-            )
-        )
-        coord["movimento_coordenado"] = (coord["up_count"] >= 2) | (coord["down_count"] >= 2)
-        coord["direcao"] = coord.apply(lambda r: "UP" if r["up_count"] >= 2 else ("DOWN" if r["down_count"] >= 2 else "—"), axis=1)
+    if not price_frames:
+        st.warning("Ainda não existe comparação (primeiro dia). Suba o dia anterior e depois este dia.")
     else:
-        coord = pd.DataFrame(columns=["key","titulo","marca","up_count","down_count","any_alert","movimento_coordenado","direcao"])
+        price_all = pd.concat(price_frames, ignore_index=True)
+        ataques = price_all[price_all["flag_ataque"] == True].copy()
 
-    # ---- AÇÕES DO DIA ----
-    # Critérios:
-    # - ATACAR: 2+ concorrentes com estoque <= 20
-    # - DEFENDER: movimento coordenado de preço (2+ concorrentes com ±10%)
-    # - MONITORAR: 1 concorrente com estoque crítico ou 1 com variação ±10%
-    # - IGNORAR: sem sinal
-    actions = stock_summary[["key","titulo","marca","conc_criticos","estoque_min","estoque_med","oportunidade_ataque"]].copy()
-    actions = actions.merge(coord[["key","movimento_coordenado","direcao"]], on="key", how="left")
-    actions["movimento_coordenado"] = actions["movimento_coordenado"].fillna(False)
-    actions["direcao"] = actions["direcao"].fillna("—")
+        if ataques.empty:
+            st.info("Nenhum ATAQUE detectado hoje com as regras atuais.")
+        else:
+            # resumo por SKU (e quantos concorrentes deram o mesmo sinal)
+            resumo = (
+                ataques
+                .groupby(["key", "titulo_new", "marca_new"], as_index=False)
+                .agg(
+                    conc_ataque=("concorrente", "nunique"),
+                    concorrentes=("concorrente", lambda x: ", ".join(sorted(set(x)))),
+                    estoque_min=("estoque_new", "min"),
+                    delta_estoque_min=("delta_estoque", "min"),
+                    preco_antigo_min=("preco_medio_old", "min"),
+                    preco_novo_max=("preco_medio_new", "max"),
+                    pct_up_max=("pct_change_preco", "max"),
+                )
+                .sort_values(["conc_ataque", "estoque_min", "pct_up_max"], ascending=[False, True, False])
+            )
 
-    # indicadores adicionais
-    actions["status"] = "IGNORAR"
-    actions.loc[actions["oportunidade_ataque"], "status"] = "ATACAR"
-    actions.loc[~actions["oportunidade_ataque"] & actions["movimento_coordenado"], "status"] = "DEFENDER"
+            exigir_2 = st.checkbox("Mostrar só se 2+ concorrentes deram sinal (mais confiável)", value=True)
+            if exigir_2:
+                resumo = resumo[resumo["conc_ataque"] >= 2]
 
-    # MONITORAR: casos intermediários
-    actions.loc[(actions["conc_criticos"] == 1) & (actions["status"] == "IGNORAR"), "status"] = "MONITORAR"
-    actions.loc[(actions["movimento_coordenado"] == False) & (actions["status"] == "IGNORAR") & (actions["direcao"] != "—"), "status"] = "MONITORAR"
+            resumo = resumo.rename(columns={"titulo_new": "titulo", "marca_new": "marca"})
 
-    def suggest(row):
-        if row["status"] == "ATACAR":
-            return "Mercado com estoque apertado (2+ concorrentes ≤20). Se você tiver estoque: segure preço ou suba 3–5% e destaque entrega/FULL."
-        if row["status"] == "DEFENDER":
-            if row["direcao"] == "DOWN":
-                return "Queda coordenada (2+ concorrentes -10%). Avaliar ajuste de preço OU reforçar valor (FULL, combo, descrição) antes de baixar."
-            if row["direcao"] == "UP":
-                return "Alta coordenada (2+ concorrentes +10%). Você pode subir preço sem medo se tiver estoque."
-            return "Movimento coordenado. Monitorar e decidir."
-        if row["status"] == "MONITORAR":
-            return "Sinal isolado (estoque ou preço). Não reage de imediato — observa mais 1 dia."
-        return "Sem sinal forte hoje."
+            c1, c2, c3 = st.columns(3)
+            c1.metric("SKUs em ATAQUE", len(resumo))
+            c2.metric("Concorrentes monitorados", len(COMPETITORS))
+            c3.metric("Regras", f"Estoque ≤{STOCK_ALERT_MAX} + Preço ≥{PRICE_ALERT_PCT}%")
 
-    actions["acao_sugerida"] = actions.apply(suggest, axis=1)
+            st.dataframe(
+                resumo[[
+                    "key","titulo","marca",
+                    "conc_ataque","concorrentes",
+                    "estoque_min","delta_estoque_min",
+                    "preco_antigo_min","preco_novo_max","pct_up_max"
+                ]],
+                use_container_width=True,
+                height=520
+            )
 
-    # Ordena para decisão
-    order_map = {"ATACAR": 0, "DEFENDER": 1, "MONITORAR": 2, "IGNORAR": 3}
-    actions["ord"] = actions["status"].map(order_map).fillna(9)
-    actions = actions.sort_values(["ord","conc_criticos","estoque_min"]).drop(columns=["ord"])
+            st.download_button(
+                "Baixar ATAQUES (CSV)",
+                resumo.to_csv(index=False).encode("utf-8"),
+                file_name=f"ataques_{snap_date_str}.csv",
+                mime="text/csv"
+            )
 
-    # ---- Mostra painéis ----
-    st.markdown("## Painel executivo (Ações do dia)")
-    st.dataframe(actions, use_container_width=True, height=420)
+    # ---------- Detalhes (opcional) ----------
+    with st.expander("📌 Ver detalhes completos por concorrente (opcional)"):
+        st.markdown("## Detalhe por concorrente (mudanças D-1 → D-0)")
+        for comp in COMPETITORS:
+            d = per_comp[comp]
+            st.markdown(f"### {comp}")
 
-    st.download_button(
-        "Baixar Ações do Dia (CSV)",
-        actions.to_csv(index=False).encode("utf-8"),
-        file_name=f"acoes_do_dia_{snap_date_str}.csv",
-        mime="text/csv"
-    )
+            if not d.get("prev_exists"):
+                st.info("Primeiro snapshot desse concorrente. Amanhã já sai comparação D-1 → D-0.")
+                st.dataframe(d["curr"].head(30), use_container_width=True)
+                continue
 
-    st.divider()
-    st.markdown("## Detalhe por concorrente (mudanças D-1 → D-0)")
-    for comp in COMPETITORS:
-        d = per_comp[comp]
-        st.markdown(f"### {comp}")
-        if not d.get("prev_exists"):
-            st.info("Primeiro snapshot desse concorrente. Amanhã já sai comparação D-1 → D-0.")
-            st.dataframe(d["curr"].head(30), use_container_width=True)
-            continue
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Novos itens", len(d["added"]))
+            c2.metric("Itens removidos", len(d["removed"]))
+            c3.metric("Mudanças detectadas", len(d["changes"]))
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Novos itens", len(d["added"]))
-        c2.metric("Itens removidos", len(d["removed"]))
-        c3.metric("Mudanças detectadas", len(d["changes"]))
+            tabs = st.tabs(["Mudanças", "Novos", "Removidos", "Preço (±10%)", "Estoque (≤20)", "Ataques (esse concorrente)"])
 
-        tabs = st.tabs(["Mudanças", "Novos", "Removidos", "Preço (±10%)", "Estoque (≤20)"])
+            with tabs[0]:
+                show_card("Mudanças (campo / antes / depois)", d["changes"])
+            with tabs[1]:
+                show_card("Novos itens", d["added"])
+            with tabs[2]:
+                show_card("Itens removidos", d["removed"])
+            with tabs[3]:
+                pm = d["price_moves"].copy()
+                pm = pm[pm["alerta_preco"] == True].sort_values("pct_change_preco")
+                pm = pm.rename(columns={"titulo_new": "titulo", "marca_new": "marca"})
+                show_card("Alertas de preço (>=10%)", pm)
+            with tabs[4]:
+                ca = d["curr_alert"].copy()
+                ca = ca[ca["alerta_estoque"] == True].sort_values("estoque")
+                show_card("Alertas de estoque (<=20)", ca)
+            with tabs[5]:
+                atk = d["price_moves"].copy()
+                atk = atk[atk["flag_ataque"] == True].copy()
+                atk = atk.rename(columns={"titulo_new": "titulo", "marca_new": "marca"})
+                show_card("ATAQUES (estoque caiu + estoque ≤20 + preço subiu ≥10%)", atk)
 
-        with tabs[0]:
-            show_card("Mudanças (campo / antes / depois)", d["changes"])
-        with tabs[1]:
-            show_card("Novos itens", d["added"])
-        with tabs[2]:
-            show_card("Itens removidos", d["removed"])
-        with tabs[3]:
-            pm = d["price_moves"].copy()
-            pm.rename(columns={"titulo_new": "titulo", "marca_new": "marca"}, inplace=True)
-            pm = pm[pm["alerta_preco"] == True].sort_values("pct_change_preco")
-            show_card("Alertas de preço (>=10%)", pm)
-        with tabs[4]:
-            ca = d["curr_alert"].copy()
-            ca = ca[ca["alerta_estoque"] == True].sort_values("estoque")
-            show_card("Alertas de estoque (<=20)", ca)
-
-    st.success("Pronto. Amanhã é só subir os 3 Excels de novo que você vai ter o comparativo + decisões do dia.")
+    st.success("Pronto. Agora o topo mostra só o que você deve ATACAR. O resto ficou escondido nos detalhes.")
