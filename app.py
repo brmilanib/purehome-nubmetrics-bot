@@ -1,11 +1,12 @@
 
+import os
 import streamlit as st
 import pandas as pd
 import sqlite3
 import json
 from datetime import datetime, date
 
-DB_PATH = "snapshots.db"
+DB_PATH = os.environ.get("DB_PATH", "/tmp/snapshots.db")
 
 # --------- CONFIG (suas regras) ----------
 STOCK_ALERT_MAX = 20              # estoque <= 20
