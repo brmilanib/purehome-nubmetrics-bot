@@ -182,7 +182,6 @@ def fmt_brl_money(v):
         v = float(v)
     except Exception:
         return ""
-    # 2 casas, mas remove zeros desnecessários
     s = f"{v:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # pt-BR
     if s.endswith(",00"):
@@ -190,23 +189,32 @@ def fmt_brl_money(v):
     return f"R$ {s}"
 
 
-def fmt_pct_signed(v, force_minus=False):
-    """
-    v em número (ex 8.24) => +8,24%
-    se force_minus=True => -8,24% (para quedas)
-    """
+def fmt_pct_signed(v):
     if pd.isna(v):
         return ""
     try:
         v = float(v)
     except Exception:
         return ""
-    sign = "-" if force_minus else ("+" if v > 0 else ("-" if v < 0 else ""))
-    vv = abs(v) if force_minus else abs(v)
-    s = f"{vv:.2f}".replace(".", ",")
+    sign = "+" if v > 0 else ("-" if v < 0 else "")
+    s = f"{abs(v):.2f}".replace(".", ",")
     if s.endswith(",00"):
         s = s[:-3]
     return f"{sign}{s}%"
+
+
+def fmt_pct_drop_as_negative(v):
+    """estoque_drop_pct vem positivo quando cai; queremos exibir como negativo."""
+    if pd.isna(v):
+        return ""
+    try:
+        v = float(v)
+    except Exception:
+        return ""
+    s = f"{abs(v):.2f}".replace(".", ",")
+    if s.endswith(",00"):
+        s = s[:-3]
+    return f"-{s}%"
 
 
 def fmt_int(v):
@@ -321,10 +329,13 @@ def compare(prev_norm: pd.DataFrame, curr_norm: pd.DataFrame):
 # ======================
 st.set_page_config(page_title="PureHome • Monitor Nubmetrics", layout="wide")
 st.title("PureHome • Monitor de Concorrentes (Nubmetrics)")
-st.caption("Suba 3 exports do Nubmetrics (um por concorrente) → compara com o último upload anterior + BI clean de ATAQUE.")
+st.caption("Suba 3 exports do Nubmetrics (um por concorrente) → compara com o último upload anterior + BI clean + aba de preços.")
 
-tab_bi, tab_hist = st.tabs(["📌 BI (Clean)", "🗂️ Controle (histórico)"])
+tab_bi, tab_prices, tab_hist = st.tabs(["📌 BI (Clean)", "📈 Preços (subiu/baixou)", "🗂️ Controle (histórico)"])
 
+# ======================
+# BI + Upload (roda uma vez e alimenta as outras abas)
+# ======================
 with tab_bi:
     st.markdown("### Regras (você controla aqui)")
     r1, r2, r3, r4, r5 = st.columns([1.2, 1.6, 1.6, 1.6, 1.2])
@@ -342,12 +353,13 @@ with tab_bi:
         top_n = st.number_input("Mostrar TOP N", min_value=5, max_value=300, value=40, step=5)
 
     st.caption(
-        "ATAQUE = estoque caiu forte + (opcional) ficou crítico + preço (ref = preço mínimo entre anúncios irmãos) subiu forte, "
+        "ATAQUE = estoque caiu + (opcional) ficou crítico + preço (ref = preço mínimo entre anúncios irmãos) subiu, "
         "comparando SEMPRE com o último upload anterior do MESMO concorrente."
     )
 
     st.divider()
     st.markdown("### Upload (3 arquivos do Nubmetrics)")
+
     auto_date = st.checkbox("Tentar pegar a data automaticamente do nome do arquivo", value=True)
     snap_date_manual = st.date_input("Se não achar no nome, usa esta data do snapshot", value=date.today())
     snap_date_str_default = snap_date_manual.isoformat()
@@ -393,7 +405,7 @@ with tab_bi:
                 })
                 continue
 
-            prev_norm = prev_pack["df"]  # BUG FIX: não re-normaliza
+            prev_norm = prev_pack["df"]  # NÃO re-normaliza (já salvo agregado)
             cmp_df, common, n_curr, _n_prev = compare(prev_norm, curr_norm)
 
             per_comp[comp] = {
@@ -412,18 +424,30 @@ with tab_bi:
                 "Itens no upload": n_curr
             })
 
-        st.markdown("#### 🔎 Debug rápido (pra você ter certeza que comparou)")
         dbg = pd.DataFrame(debug_rows)
+        st.markdown("#### 🔎 Debug rápido (pra você ter certeza que comparou)")
         st.dataframe(dbg, use_container_width=True, height=160)
 
-        # BI CLEAN
+        # ----------------------
+        # BI CLEAN (ATAQUE)
+        # ----------------------
         frames = []
+        price_change_rows = []  # <- para a aba de preços
+
         for comp, pack in per_comp.items():
             if pack["cmp"] is None or pack["common"] == 0:
                 continue
 
             d = pack["cmp"].copy()
             d["concorrente"] = comp
+
+            # guarda lista geral de alteração de preço (qualquer mudança)
+            # (só quando temos preço antigo e novo e eles são diferentes)
+            pr = d.dropna(subset=["preco_old", "preco_new"]).copy()
+            pr = pr[pr["preco_new"] != pr["preco_old"]].copy()
+            if not pr.empty:
+                pr["dir"] = pr.apply(lambda r: "UP" if float(r["preco_new"]) > float(r["preco_old"]) else "DOWN", axis=1)
+                price_change_rows.append(pr)
 
             d["flag_estoque_critico"] = d["estoque_new"].fillna(10**9) <= float(estoque_critico)
             d["flag_queda_estoque"] = d["estoque_drop_pct"].fillna(-10**9) >= float(queda_min_estoque_pct)
@@ -438,11 +462,12 @@ with tab_bi:
 
         if not frames:
             st.info("Ainda não deu para comparar (provável 1º upload de todos). No próximo upload já aparece.")
+            st.session_state["last_results"] = {"ready": False}
             st.stop()
 
         all_cmp = pd.concat(frames, ignore_index=True)
 
-        # Estoque por concorrente (pra você bater o olho)
+        # Estoque por concorrente
         stock_by_comp = (
             all_cmp.groupby(["key", "concorrente"], as_index=False)
                   .agg(estoque=("estoque_new", "min"))
@@ -453,10 +478,7 @@ with tab_bi:
             parts = []
             for c in COMPETITORS:
                 v = row.get(c)
-                if pd.isna(v):
-                    parts.append(f"{c}:-")
-                else:
-                    parts.append(f"{c}:{fmt_int(v)}")
+                parts.append(f"{c}:{fmt_int(v) if pd.notna(v) else '-'}")
             return " | ".join(parts)
 
         stock_pivot["estoques_concorrentes"] = stock_pivot.apply(join_stocks, axis=1)
@@ -475,9 +497,7 @@ with tab_bi:
                       variacao_preco_pct_max=("preco_pct", "max"),
                       anuncios_irmaos_max=("anuncios_irmaos", "max"),
                   )
-        )
-
-        g = g.merge(stock_pivot, on="key", how="left")
+        ).merge(stock_pivot, on="key", how="left")
 
         atacar = g[g["concorrentes_com_sinal"] >= int(min_concorrentes)].copy()
 
@@ -501,9 +521,6 @@ with tab_bi:
                   .drop(columns=["score"])
         )
 
-        # ======================
-        # APRESENTAÇÃO CLEAN
-        # ======================
         st.markdown("### 🎯 Produtos para ATACAR (BI CLEAN)")
 
         show = atacar[[
@@ -520,8 +537,7 @@ with tab_bi:
             "anuncios_irmaos_max",
         ]].copy()
 
-        # renomeia colunas (claras)
-        col_rename = {
+        show = show.rename(columns={
             "key": "SKU / ID",
             "titulo": "Produto",
             "marca": "Marca",
@@ -533,16 +549,13 @@ with tab_bi:
             "preco_atual_min": "Preço atual",
             "variacao_preco_pct_max": "Variação preço",
             "anuncios_irmaos_max": "Anúncios irmãos",
-        }
-        show = show.rename(columns=col_rename)
+        })
 
-        # formata textos (percent e R$) mantendo colunas numéricas separadas pra estilo
-        # vamos criar colunas "display" e manter as originais só pra style
         show["_drop_num"] = atacar["queda_estoque_pct_max"].values
         show["_price_num"] = atacar["variacao_preco_pct_max"].values
 
-        show["Queda estoque"] = show["_drop_num"].apply(lambda v: fmt_pct_signed(v, force_minus=True))
-        show["Variação preço"] = show["_price_num"].apply(lambda v: fmt_pct_signed(v, force_minus=False))
+        show["Queda estoque"] = show["_drop_num"].apply(fmt_pct_drop_as_negative)
+        show["Variação preço"] = show["_price_num"].apply(fmt_pct_signed)
 
         show["Preço anterior"] = show["Preço anterior"].apply(fmt_brl_money)
         show["Preço atual"] = show["Preço atual"].apply(fmt_brl_money)
@@ -551,17 +564,15 @@ with tab_bi:
         show["Concorrentes c/ sinal"] = show["Concorrentes c/ sinal"].apply(fmt_int)
         show["Anúncios irmãos"] = show["Anúncios irmãos"].apply(fmt_int)
 
-        # === estilos: queda vermelho negrito, alta verde negrito
         def style_pct(row):
             styles = [""] * len(row)
             cols = list(row.index)
 
-            # queda (vermelho)
             if "Queda estoque" in cols:
                 i = cols.index("Queda estoque")
-                if pd.notna(row.get("_drop_num")) and row.get("_drop_num") > 0:
+                if pd.notna(row.get("_drop_num")) and float(row.get("_drop_num")) > 0:
                     styles[i] = "color:#b00020;font-weight:700;"
-            # variação preço (verde ou vermelho)
+
             if "Variação preço" in cols:
                 i = cols.index("Variação preço")
                 v = row.get("_price_num")
@@ -574,32 +585,7 @@ with tab_bi:
                         styles[i] = "color:#b00020;font-weight:700;"
             return styles
 
-        def highlight_strong(row):
-            # verde clarinho nas mudanças mais agressivas
-            # (top 25% de queda de estoque + top 25% de alta de preço)
-            if len(show) < 4:
-                return [""] * len(row)
-
-            q_drop = float(atacar["queda_estoque_pct_max"].quantile(0.75))
-            q_price = float(atacar["variacao_preco_pct_max"].quantile(0.75))
-
-            strong = (
-                pd.notna(row.get("_drop_num")) and float(row.get("_drop_num")) >= q_drop
-                and pd.notna(row.get("_price_num")) and float(row.get("_price_num")) >= q_price
-            )
-            if strong:
-                return ["background-color:#d8f5d8;"] * len(row)
-            return [""] * len(row)
-
-        # remove colunas auxiliares da visão final, mas mantém pra style via row.get
-        # (o pandas styler ainda "vê" elas se estiverem no df; então deixamos e escondemos)
-        styled = (
-            show.style
-                .apply(highlight_strong, axis=1)
-                .apply(style_pct, axis=1)
-                .hide(axis="columns", subset=["_drop_num", "_price_num"])
-        )
-
+        styled = show.style.apply(style_pct, axis=1).hide(axis="columns", subset=["_drop_num", "_price_num"])
         st.dataframe(styled, use_container_width=True, height=520)
 
         st.download_button(
@@ -609,6 +595,128 @@ with tab_bi:
             mime="text/csv"
         )
 
+        # ----------------------
+        # SALVA RESULTADOS PRA ABA DE PREÇOS
+        # ----------------------
+        if price_change_rows:
+            price_all = pd.concat(price_change_rows, ignore_index=True)
+        else:
+            price_all = pd.DataFrame(columns=list(all_cmp.columns) + ["dir"])
+
+        st.session_state["last_results"] = {
+            "ready": True,
+            "debug": dbg,
+            "price_all": price_all,
+        }
+
+# ======================
+# ABA: PREÇOS (subiu/baixou)
+# ======================
+with tab_prices:
+    st.markdown("### 📈 Alterações de preço (clean)")
+    st.caption("Aqui é simples: lista TUDO que mudou preço (sem mínimo de %). Separado em SUBIU e DESCEU.")
+
+    res = st.session_state.get("last_results", {"ready": False})
+    if not res.get("ready"):
+        st.info("Primeiro: suba os 3 arquivos e clique **Processar e gerar BI** na aba BI (Clean).")
+    else:
+        price_all = res["price_all"].copy()
+
+        if price_all.empty:
+            st.warning("Não encontrei alterações de preço na comparação atual.")
+        else:
+            # monta tabela clean
+            price_show = price_all[[
+                "concorrente", "key", "titulo", "marca",
+                "preco_old", "preco_new", "preco_pct",
+                "estoque_new", "anuncios_irmaos"
+            ]].copy()
+
+            price_show = price_show.rename(columns={
+                "concorrente": "Concorrente",
+                "key": "SKU / ID",
+                "titulo": "Produto",
+                "marca": "Marca",
+                "preco_old": "Preço anterior",
+                "preco_new": "Preço atual",
+                "preco_pct": "Variação (%)",
+                "estoque_new": "Estoque atual",
+                "anuncios_irmaos": "Anúncios irmãos",
+            })
+
+            # formata
+            price_show["_pct_num"] = price_show["Variação (%)"]
+            price_show["Preço anterior"] = price_show["Preço anterior"].apply(fmt_brl_money)
+            price_show["Preço atual"] = price_show["Preço atual"].apply(fmt_brl_money)
+            price_show["Variação (%)"] = price_show["_pct_num"].apply(fmt_pct_signed)
+            price_show["Estoque atual"] = price_show["Estoque atual"].apply(fmt_int)
+            price_show["Anúncios irmãos"] = price_show["Anúncios irmãos"].apply(fmt_int)
+
+            # separa subiu/baixou pelo número real antes de formatar
+            up_mask = price_all["preco_new"] > price_all["preco_old"]
+            down_mask = price_all["preco_new"] < price_all["preco_old"]
+
+            up_df = price_show[up_mask.values].copy()
+            down_df = price_show[down_mask.values].copy()
+
+            # ordena: maiores variações primeiro (não filtra, só ordena)
+            if "_pct_num" in up_df.columns:
+                up_df = up_df.sort_values("_pct_num", ascending=False)
+            if "_pct_num" in down_df.columns:
+                down_df = down_df.sort_values("_pct_num", ascending=True)
+
+            # estilos
+            def style_price_rows(direction: str):
+                def _sty(row):
+                    styles = [""] * len(row)
+                    cols = list(row.index)
+                    if "Variação (%)" in cols:
+                        i = cols.index("Variação (%)")
+                        if direction == "UP":
+                            styles[i] = "color:#0a7a0a;font-weight:700;"
+                        else:
+                            styles[i] = "color:#b00020;font-weight:700;"
+                    return styles
+                return _sty
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("#### ✅ Preços que SUBIRAM")
+                if up_df.empty:
+                    st.info("Nada subiu.")
+                else:
+                    st.dataframe(
+                        up_df.style.apply(style_price_rows("UP"), axis=1).hide(axis="columns", subset=["_pct_num"]),
+                        use_container_width=True,
+                        height=520
+                    )
+                    st.download_button(
+                        "Baixar SUBIU (CSV)",
+                        up_df.drop(columns=["_pct_num"]).to_csv(index=False).encode("utf-8"),
+                        file_name="precos_subiram.csv",
+                        mime="text/csv"
+                    )
+
+            with c2:
+                st.markdown("#### 🔻 Preços que BAIXARAM")
+                if down_df.empty:
+                    st.info("Nada baixou.")
+                else:
+                    st.dataframe(
+                        down_df.style.apply(style_price_rows("DOWN"), axis=1).hide(axis="columns", subset=["_pct_num"]),
+                        use_container_width=True,
+                        height=520
+                    )
+                    st.download_button(
+                        "Baixar BAIXOU (CSV)",
+                        down_df.drop(columns=["_pct_num"]).to_csv(index=False).encode("utf-8"),
+                        file_name="precos_baixaram.csv",
+                        mime="text/csv"
+                    )
+
+# ======================
+# ABA: HISTÓRICO
+# ======================
 with tab_hist:
     st.markdown("### Histórico de uploads")
     hist = list_snapshots(limit=200)
