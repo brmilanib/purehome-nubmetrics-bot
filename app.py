@@ -7,7 +7,10 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-# ✅ NÃO usa /tmp (no Cloud isso some fácil). Usa arquivo local.
+# =========================
+# CONFIG / DB
+# =========================
+# ✅ NÃO usa /tmp (no Streamlit Cloud pode sumir). Usa arquivo local.
 DB_PATH = os.environ.get("DB_PATH", "snapshots.db")
 
 st.set_page_config(page_title="PureHome • Monitor Nubmetrics", layout="wide")
@@ -16,7 +19,9 @@ st.caption("Suba 3 exports do Nubmetrics (um por concorrente) → compara com o 
 
 COMPETITORS = ["AUMA", "BAGATELLE", "PERFUMES_BHZ"]
 
-# -------------------- DB --------------------
+# =========================
+# DB helpers
+# =========================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -31,6 +36,7 @@ def init_db():
         """)
 init_db()
 
+
 def save_snapshot(competitor: str, snapshot_date: str, filename: str, df: pd.DataFrame) -> int:
     payload = df.to_json(orient="records", force_ascii=False)
     with sqlite3.connect(DB_PATH) as conn:
@@ -40,6 +46,7 @@ def save_snapshot(competitor: str, snapshot_date: str, filename: str, df: pd.Dat
             (competitor, snapshot_date, datetime.now().isoformat(timespec="seconds"), filename, payload)
         )
         return int(cur.lastrowid)
+
 
 def load_last_snapshot(competitor: str):
     """Pega o ÚLTIMO snapshot salvo desse concorrente (por id desc)."""
@@ -60,6 +67,7 @@ def load_last_snapshot(competitor: str):
     df = pd.read_json(data_json, orient="records")
     return {"id": sid, "snapshot_date": d, "uploaded_at": uploaded_at, "filename": filename, "df": df}
 
+
 def list_snapshots():
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql_query(
@@ -72,7 +80,10 @@ def list_snapshots():
         )
     return df
 
-# -------------------- Normalização --------------------
+
+# =========================
+# Normalização
+# =========================
 CANON_MAP = {
     "título": "titulo",
     "marca": "marca",
@@ -93,13 +104,17 @@ CANON_MAP = {
     "estoque": "estoque",
 }
 
+
 def detect_snapshot_date_from_filename(filename: str) -> Optional[str]:
+    """Tenta extrair uma data do nome do arquivo."""
     name = str(filename)
 
+    # YYYY-MM-DD
     iso = re.findall(r"(\d{4}-\d{2}-\d{2})", name)
     if iso:
         return iso[-1]
 
+    # DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY
     br = re.findall(r"(\d{2})[\/\-\._](\d{2})[\/\-\._](\d{4})", name)
     if br:
         dd, mm, yyyy = br[-1]
@@ -107,9 +122,10 @@ def detect_snapshot_date_from_filename(filename: str) -> Optional[str]:
 
     return None
 
+
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    ✅ Arruma "anúncios irmãos":
+    ✅ Corrige "anúncios irmãos":
       - Estoque NÃO soma (estoque é compartilhado) -> MAX
       - Preço ref = preço mínimo (preço de guerra)
       - Cria anuncios_irmaos
@@ -119,8 +135,12 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip().lower() for c in df.columns]
     df = df.rename(columns={c: CANON_MAP.get(c, c) for c in df.columns})
 
-    for c in ["sku", "gtin", "n_peca", "titulo", "marca", "estoque", "preco_medio", "vendas_unid",
-              "desconto", "frete_gratis", "full", "tipo_publicacao"]:
+    needed = [
+        "sku", "gtin", "n_peca", "titulo", "marca",
+        "estoque", "preco_medio", "vendas_unid",
+        "desconto", "frete_gratis", "full", "tipo_publicacao"
+    ]
+    for c in needed:
         if c not in df.columns:
             df[c] = pd.NA
 
@@ -134,8 +154,10 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         s = str(v).strip()
         if s == "" or s.lower() == "nan":
             return None
+        # 123.0 -> 123
         if re.fullmatch(r"\d+\.0", s):
             s = s[:-2]
+        # scientific notation
         if "e+" in s.lower():
             try:
                 s = str(int(float(s)))
@@ -196,12 +218,16 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     price_wavg_map = df.groupby("key").apply(wavg_price)
     out["preco_wavg"] = out["key"].map(price_wavg_map)
 
-    out["preco_ref"] = out["preco_min"]  # ✅ preço que realmente compete
+    # ✅ Preço de referência para competir: o menor preço (guerra)
+    out["preco_ref"] = out["preco_min"]
 
     out = out.sort_values(["vendas_unid", "estoque"], ascending=[False, True], na_position="last")
     return out
 
-# -------------------- Diff / Ataque --------------------
+
+# =========================
+# Diff / Ataque
+# =========================
 def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame,
                  stock_crit_max: int,
                  stock_drop_pct_min: float,
@@ -218,6 +244,7 @@ def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame,
     pct_change_estoque = (merged["estoque_new"] - merged["estoque_old"]) / denom_e * 100.0
     merged["pct_drop_estoque"] = pct_change_estoque.apply(lambda v: (-v) if pd.notna(v) and v < 0 else 0.0)
 
+    # ✅ regra de ataque (MESMO concorrente, comparando com upload anterior)
     merged["flag_ataque"] = (
         (merged["delta_estoque"].fillna(0) < 0) &
         (merged["pct_drop_estoque"].fillna(0) >= stock_drop_pct_min) &
@@ -240,9 +267,10 @@ def compute_diff(prev: pd.DataFrame, curr: pd.DataFrame,
     out = out.rename(columns={"titulo_new": "titulo", "marca_new": "marca"})
     return out
 
+
 def build_score_row(row, stock_crit_max, stock_drop_pct_min, price_up_min):
-    pct_up = float(row.get("alta_preco_ref_%_max")) if pd.notna(row.get("alta_preco_ref_%_max")) else 0.0
-    drop = float(row.get("queda_estoque_%_max")) if pd.notna(row.get("queda_estoque_%_max")) else 0.0
+    pct_up = float(row.get("alta_preco_ref_pct_max")) if pd.notna(row.get("alta_preco_ref_pct_max")) else 0.0
+    drop = float(row.get("queda_estoque_pct_max")) if pd.notna(row.get("queda_estoque_pct_max")) else 0.0
     conc = int(row.get("conc_ataque")) if pd.notna(row.get("conc_ataque")) else 0
     est = float(row.get("estoque_atual")) if pd.notna(row.get("estoque_atual")) else stock_crit_max
 
@@ -252,16 +280,21 @@ def build_score_row(row, stock_crit_max, stock_drop_pct_min, price_up_min):
     s4 = 0.8 * (1.0 - min(est / max(stock_crit_max, 1e-9), 1.0)) if stock_crit_max > 0 else 0.0
     return round(s1 + s2 + s3 + s4, 3)
 
+
 def style_aggressive(df: pd.DataFrame):
     def row_style(row):
         score = float(row.get("score")) if pd.notna(row.get("score")) else 0.0
+        # começa a pintar a partir de ~1.2
         alpha = min(0.75, max(0.0, (score - 1.2) * 0.22))
         if alpha <= 0:
             return [""] * len(row)
         return [f"background-color: rgba(0, 200, 0, {alpha})"] * len(row)
     return df.style.apply(row_style, axis=1)
 
-# -------------------- UI --------------------
+
+# =========================
+# UI
+# =========================
 tab_bi, tab_ctrl = st.tabs(["📌 BI (Clean)", "🧾 Controle (histórico)"])
 
 with tab_bi:
@@ -348,10 +381,10 @@ with tab_bi:
                 concorrentes=("concorrente", lambda x: ", ".join(sorted(set(x)))),
                 anuncios_irmaos=("anuncios_irmaos_new", "max"),
                 estoque_atual=("estoque_new", "min"),
-                queda_estoque_%_max=("pct_drop_estoque", "max"),
+                queda_estoque_pct_max=("pct_drop_estoque", "max"),
                 preco_ref_antes=("preco_ref_old", "min"),
                 preco_ref_agora=("preco_ref_new", "max"),
-                alta_preco_ref_%_max=("pct_change_preco_ref", "max"),
+                alta_preco_ref_pct_max=("pct_change_preco_ref", "max"),
                 preco_min_agora=("preco_min_new", "min"),
                 preco_max_agora=("preco_max_new", "max"),
                 preco_wavg_agora=("preco_wavg_new", "max"),
@@ -387,7 +420,7 @@ with tab_ctrl:
 
     st.markdown("### Diagnóstico rápido")
     if snaps.empty:
-        st.error("Seu banco está vazio. Isso acontece quando a instância reinicia ou você trocou o app. Sobe os 3 arquivos 1x pra criar baseline, depois sobe de novo pra comparar.")
+        st.error("Seu banco está vazio. Sobe os 3 arquivos 1x pra criar baseline, depois sobe de novo pra comparar.")
     else:
         st.success(f"Banco OK: {len(snaps)} snapshots salvos.")
         byc = snaps.groupby("competitor").size().reset_index(name="qtd")
