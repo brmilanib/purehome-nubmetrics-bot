@@ -157,7 +157,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df["vendas_unid"] = pd.to_numeric(df["vendas_unid"], errors="coerce")
     df["vendas_valor"] = pd.to_numeric(df["vendas_valor"], errors="coerce")
 
-    # chave robusta
     def make_key(row):
         for k in ["sku","gtin","n_peca","oem"]:
             v = row.get(k)
@@ -175,6 +174,8 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["key"].notna()].copy()
     df["key"] = df["key"].astype(str)
 
+    # remove colunas duplicadas (segurança)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
 
 # =========================================================
@@ -204,8 +205,8 @@ def aggregate_siblings(df: pd.DataFrame) -> pd.DataFrame:
     agg = df.groupby("key", as_index=False).agg(
         preco_min=("preco_medio","min"),
         preco_max=("preco_medio","max"),
-        estoque_atual=("estoque","max"),            # NÃO soma!
-        vendas_unid=("vendas_unid","sum"),          # soma vendas ok
+        estoque_atual=("estoque","max"),       # NÃO soma!
+        vendas_unid=("vendas_unid","sum"),
         vendas_valor=("vendas_valor","sum"),
         anuncios_irmaos=("key","size"),
     )
@@ -218,6 +219,10 @@ def aggregate_siblings(df: pd.DataFrame) -> pd.DataFrame:
         "estoque_atual",
         "anuncios_irmaos"
     ]]
+
+    # segurança
+    agg["key"] = agg["key"].astype(str)
+    agg = agg.loc[:, ~agg.columns.duplicated()].copy()
     return agg
 
 # =========================================================
@@ -228,16 +233,12 @@ def ensure_product_df(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     df = df.copy()
-    # remove colunas duplicadas (causa merge error)
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    # se já é product-level
     if PRODUCT_COLS.issubset(set(df.columns)):
-        if "key" in df.columns:
-            df["key"] = df["key"].astype(str)
+        df["key"] = df["key"].astype(str)
         return df
 
-    # senão: trata como raw antigo e reconstrói
     norm = normalize_df(df)
     prod = aggregate_siblings(norm)
     return prod
@@ -259,7 +260,6 @@ def compute_product_diff(prev_prod: pd.DataFrame, curr_prod: pd.DataFrame) -> pd
     prev = ensure_product_df(prev_prod)
     curr = ensure_product_df(curr_prod)
 
-    # segurança extra
     prev = prev.loc[:, ~prev.columns.duplicated()].copy()
     curr = curr.loc[:, ~curr.columns.duplicated()].copy()
 
@@ -300,7 +300,7 @@ def compute_product_diff(prev_prod: pd.DataFrame, curr_prod: pd.DataFrame) -> pd
     return out
 
 # =========================================================
-# FORMAT
+# FORMAT / STYLE
 # =========================================================
 def fmt_currency(x):
     if pd.isna(x):
@@ -340,7 +340,6 @@ def style_price_pct(s: pd.Series):
     return styles
 
 def style_drop_pct(s: pd.Series):
-    # positivo = caiu => vermelho forte
     styles = []
     for v in s:
         if v == "" or pd.isna(v):
@@ -364,9 +363,6 @@ tab_bi, tab_preco, tab_ranking, tab_controle = st.tabs(
     ["🎯 BI (Clean)", "💸 Preços (↑/↓)", "🏆 Ranking Mais Vendidos", "🗂️ Controle (histórico)"]
 )
 
-# =========================================================
-# SHARED STATE (session)
-# =========================================================
 if "last_run" not in st.session_state:
     st.session_state.last_run = None
 
@@ -412,7 +408,6 @@ with tab_bi:
             st.error(f"Faltou upload: {', '.join(missing)}")
             st.stop()
 
-        # decide snapshot_date
         effective_date = snap_date_str
         if pick_date_from_name:
             for comp, f in uploaded.items():
@@ -423,7 +418,7 @@ with tab_bi:
 
         per_comp = {}
         debug_rows = []
-        all_price_changes = []  # para tab de preços
+        all_price_changes = []
 
         for comp, f in uploaded.items():
             raw = pd.read_excel(f)
@@ -431,8 +426,6 @@ with tab_bi:
             prod = aggregate_siblings(norm)
 
             prev = load_last_snapshot_before(comp, effective_date)
-
-            # salva sempre em product-level
             save_snapshot(comp, effective_date, f.name, prod)
 
             if prev is None:
@@ -446,7 +439,6 @@ with tab_bi:
                 continue
 
             prev_df = ensure_product_df(prev["df"])
-
             diff = compute_product_diff(prev_df, prod)
 
             common = set(prev_df["key"].astype(str)).intersection(set(prod["key"].astype(str)))
@@ -459,16 +451,13 @@ with tab_bi:
 
             per_comp[comp] = {"prev": prev, "curr": prod, "diff": diff}
 
-            # captura alterações de preço (qualquer %)
             if diff is not None and len(diff):
                 tmp = diff.copy()
                 tmp["concorrente"] = comp
                 tmp["snapshot_date"] = effective_date
-                # só onde preço mudou
                 tmp = tmp[tmp["preco_old"].astype(str) != tmp["preco_new"].astype(str)]
                 all_price_changes.append(tmp)
 
-        # salva para usar nas outras abas sem refazer upload
         st.session_state.last_run = {
             "effective_date": effective_date,
             "per_comp": per_comp,
@@ -508,9 +497,10 @@ with tab_bi:
         else:
             sig_all = pd.concat(signals, ignore_index=True)
 
-            def mk_estoques_por_conc(g):
+            # ✅ função que monta string "AUMA:14 | BAGATELLE:5 | PERFUMES_BHZ:0"
+            def mk_estoques_por_conc(group: pd.DataFrame):
                 parts = []
-                for _, r in g.iterrows():
+                for _, r in group.iterrows():
                     e = "" if pd.isna(r["estoque_new"]) else int(r["estoque_new"])
                     parts.append(f'{r["concorrente"]}:{e}')
                 return " | ".join(parts)
@@ -527,8 +517,9 @@ with tab_bi:
                 anuncios_irmaos=("anuncios_irmaos","max"),
             )
 
-            sto_map = sig_all.groupby("key", as_index=False).apply(mk_estoques_por_conc).reset_index(drop=True)
-            out["estoques_por_concorrente"] = sto_map
+            # ✅ FIX DO ERRO: em vez de out["..."]=sto_map (quebra), faz MERGE pelo key
+            sto_map_df = sig_all.groupby("key").apply(mk_estoques_por_conc).reset_index(name="estoques_por_concorrente")
+            out = out.merge(sto_map_df, on="key", how="left")
 
             out = out[out["concorrentes_com_sinal"] >= int(sinal_min_concorrentes)].copy()
 
@@ -553,7 +544,6 @@ with tab_bi:
             out_show["Variação preço"] = out_show["Variação preço"].apply(fmt_pct)
             out_show["Preço anterior"] = out_show["Preço anterior"].apply(fmt_currency)
             out_show["Preço atual"] = out_show["Preço atual"].apply(fmt_currency)
-
             out_show["Estoque atual (mín)"] = out_show["Estoque atual (mín)"].fillna("").apply(lambda x: "" if x=="" else int(x))
 
             sty = out_show.style
@@ -572,7 +562,7 @@ with tab_bi:
         st.success("Rodou. Agora você pode ir na aba Preços (↑/↓) e Ranking, sem precisar reprocessar.")
 
 # =========================================================
-# TAB PREÇOS (↑/↓) — QUALQUER % (não importa %)
+# TAB PREÇOS (↑/↓) — QUALQUER %
 # =========================================================
 with tab_preco:
     st.subheader("💸 Preços (alterações) — separado por SUBIU vs BAIXOU")
@@ -584,12 +574,10 @@ with tab_preco:
         if df is None or df.empty:
             st.warning("Não achei mudanças de preço no comparativo desse run.")
         else:
-            # calcula direção
             df["delta_preco"] = df["preco_new"] - df["preco_old"]
             df_up = df[df["delta_preco"] > 0].copy()
             df_down = df[df["delta_preco"] < 0].copy()
 
-            # formata tabela
             def build_table(x: pd.DataFrame):
                 x = x.copy()
                 x["Preço anterior"] = x["preco_old"].apply(fmt_currency)
@@ -609,35 +597,21 @@ with tab_preco:
                 for c in cols:
                     if c not in x.columns:
                         x[c] = ""
-                x = x[cols].copy()
-                return x
+                return x[cols].copy()
 
             t_up = build_table(df_up)
             t_down = build_table(df_down)
 
             col1, col2 = st.columns(2)
-
             with col1:
                 st.markdown("### 📈 Preços que SUBIRAM")
                 sty_up = t_up.style.apply(style_price_pct, subset=["Variação preço"])
                 st.dataframe(sty_up, use_container_width=True, height=520)
-                st.download_button(
-                    "Baixar Preços que Subiram (CSV)",
-                    df_up.to_csv(index=False).encode("utf-8"),
-                    file_name=f"precos_subiram_{st.session_state.last_run['effective_date']}.csv",
-                    mime="text/csv"
-                )
 
             with col2:
                 st.markdown("### 📉 Preços que BAIXARAM")
                 sty_down = t_down.style.apply(style_price_pct, subset=["Variação preço"])
                 st.dataframe(sty_down, use_container_width=True, height=520)
-                st.download_button(
-                    "Baixar Preços que Baixaram (CSV)",
-                    df_down.to_csv(index=False).encode("utf-8"),
-                    file_name=f"precos_baixaram_{st.session_state.last_run['effective_date']}.csv",
-                    mime="text/csv"
-                )
 
 # =========================================================
 # TAB RANKING MAIS VENDIDOS
@@ -746,13 +720,6 @@ with tab_ranking:
 
         st.dataframe(sty, use_container_width=True, height=560)
 
-        st.download_button(
-            "Baixar Ranking (CSV)",
-            df_rank.to_csv(index=False).encode("utf-8"),
-            file_name="ranking_mais_vendidos.csv",
-            mime="text/csv"
-        )
-
 # =========================================================
 # TAB CONTROLE (HISTÓRICO)
 # =========================================================
@@ -772,5 +739,3 @@ with tab_controle:
     else:
         hist_df = pd.DataFrame(hist, columns=["concorrente","data","enviado_em","arquivo"])
         st.dataframe(hist_df, use_container_width=True, height=420)
-
-        st.caption("Se um dia não comparar, geralmente é export com chave diferente. Agora o app se adapta melhor a snapshots antigos.")
